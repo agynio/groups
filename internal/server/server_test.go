@@ -275,17 +275,18 @@ func TestGroupCRUDAndOpenFGATuples(t *testing.T) {
 
 	created, err := server.CreateGroup(context.Background(), &groupsv1.CreateGroupRequest{
 		OrganizationId: organizationID.String(),
-		Name:           "Engineering",
-		Description:    "Eng team",
+		Name:           "engineering",
+		Description:    "eng team",
 		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
 	})
 	require.NoError(t, err)
-	require.Equal(t, "Engineering", created.GetGroup().GetName())
+	require.Equal(t, "engineering", created.GetGroup().GetName())
 	require.Len(t, auth.writes, 1)
-	require.Equal(t, "organization:"+organizationID.String(), auth.writes[0].GetWrites()[0].GetUser())
+	require.Equal(t, "group:"+created.GetGroup().GetMeta().GetId(), auth.writes[0].GetWrites()[0].GetUser())
+	require.Equal(t, "organization:"+organizationID.String(), auth.writes[0].GetWrites()[0].GetObject())
 	require.Equal(t, "org", auth.writes[0].GetWrites()[0].GetRelation())
 
-	updatedName := "Platform"
+	updatedName := "platform"
 	updated, err := server.UpdateGroup(context.Background(), &groupsv1.UpdateGroupRequest{Id: created.GetGroup().GetMeta().GetId(), Name: &updatedName})
 	require.NoError(t, err)
 	require.Equal(t, updatedName, updated.GetGroup().GetName())
@@ -301,7 +302,8 @@ func TestGroupCRUDAndOpenFGATuples(t *testing.T) {
 	_, err = server.DeleteGroup(context.Background(), &groupsv1.DeleteGroupRequest{Id: created.GetGroup().GetMeta().GetId()})
 	require.NoError(t, err)
 	require.Len(t, auth.writes, 2)
-	require.Equal(t, "organization:"+organizationID.String(), auth.writes[1].GetDeletes()[0].GetUser())
+	require.Equal(t, "group:"+created.GetGroup().GetMeta().GetId(), auth.writes[1].GetDeletes()[0].GetUser())
+	require.Equal(t, "organization:"+organizationID.String(), auth.writes[1].GetDeletes()[0].GetObject())
 	require.Len(t, publisher.deleted, 1)
 }
 
@@ -315,7 +317,7 @@ func TestMembershipLifecycleAndBatchLookup(t *testing.T) {
 	organizationID := uuid.New()
 	created, err := server.CreateGroup(context.Background(), &groupsv1.CreateGroupRequest{
 		OrganizationId: organizationID.String(),
-		Name:           "Engineering",
+		Name:           "engineering",
 		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
 	})
 	require.NoError(t, err)
@@ -385,7 +387,7 @@ func TestInvalidMembershipInputs(t *testing.T) {
 	organizationID := uuid.New()
 	created, err := server.CreateGroup(context.Background(), &groupsv1.CreateGroupRequest{
 		OrganizationId: organizationID.String(),
-		Name:           "Engineering",
+		Name:           "engineering",
 		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
 	})
 	require.NoError(t, err)
@@ -426,7 +428,7 @@ func TestPublishFailureDoesNotRollbackMembership(t *testing.T) {
 	organizationID := uuid.New()
 	created, err := server.CreateGroup(context.Background(), &groupsv1.CreateGroupRequest{
 		OrganizationId: organizationID.String(),
-		Name:           "Engineering",
+		Name:           "engineering",
 		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
 	})
 	require.NoError(t, err)

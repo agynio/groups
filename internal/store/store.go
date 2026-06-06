@@ -113,6 +113,7 @@ func (s *Store) ListGroups(ctx context.Context, filter ListGroupsFilter, pageSiz
 		args,
 		cursor,
 		pageSize,
+		"groups.id",
 		scanGroup,
 		func(group Group) uuid.UUID { return group.Meta.ID },
 	)
@@ -266,6 +267,7 @@ func (s *Store) ListMembers(ctx context.Context, filter ListMembersFilter, pageS
 		args,
 		cursor,
 		pageSize,
+		"group_memberships.id",
 		scanMembership,
 		func(membership GroupMembership) uuid.UUID { return membership.Meta.ID },
 	)
@@ -288,6 +290,7 @@ func (s *Store) ListMemberGroups(ctx context.Context, filter ListMemberGroupsFil
 		args,
 		cursor,
 		pageSize,
+		"groups.id",
 		scanGroup,
 		func(group Group) uuid.UUID { return group.Meta.ID },
 	)

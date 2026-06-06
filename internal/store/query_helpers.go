@@ -45,17 +45,7 @@ func appendClause(clauses []string, args []any, format string, value any) ([]str
 	return clauses, args
 }
 
-func listEntities[T any](
-	ctx context.Context,
-	pool *pgxpool.Pool,
-	baseQuery string,
-	clauses []string,
-	args []any,
-	cursor *PageCursor,
-	pageSize int32,
-	scan func(pgx.Row) (T, error),
-	idFunc func(T) uuid.UUID,
-) ([]T, *PageCursor, error) {
+func buildListEntitiesQuery(baseQuery string, clauses []string, args []any, cursor *PageCursor, pageSize int32, cursorColumn string) (string, []any, int32) {
 	limit := NormalizePageSize(pageSize)
 
 	query := strings.Builder{}
@@ -63,7 +53,7 @@ func listEntities[T any](
 
 	paramIndex := len(args) + 1
 	if cursor != nil {
-		clauses = append(clauses, fmt.Sprintf("id > $%d", paramIndex))
+		clauses = append(clauses, fmt.Sprintf("%s > $%d", cursorColumn, paramIndex))
 		args = append(args, cursor.AfterID)
 		paramIndex++
 	}
@@ -72,10 +62,27 @@ func listEntities[T any](
 		query.WriteString(" WHERE ")
 		query.WriteString(strings.Join(clauses, " AND "))
 	}
-	query.WriteString(fmt.Sprintf(" ORDER BY id ASC LIMIT $%d", paramIndex))
+	query.WriteString(fmt.Sprintf(" ORDER BY %s ASC LIMIT $%d", cursorColumn, paramIndex))
 	args = append(args, int(limit)+1)
 
-	rows, err := pool.Query(ctx, query.String(), args...)
+	return query.String(), args, limit
+}
+
+func listEntities[T any](
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	baseQuery string,
+	clauses []string,
+	args []any,
+	cursor *PageCursor,
+	pageSize int32,
+	cursorColumn string,
+	scan func(pgx.Row) (T, error),
+	idFunc func(T) uuid.UUID,
+) ([]T, *PageCursor, error) {
+	query, args, limit := buildListEntitiesQuery(baseQuery, clauses, args, cursor, pageSize, cursorColumn)
+
+	rows, err := pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, nil, err
 	}

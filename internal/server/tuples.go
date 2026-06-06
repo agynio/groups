@@ -20,9 +20,9 @@ const (
 func (s *Server) writeGroupOrgTuple(ctx context.Context, groupID uuid.UUID, organizationID uuid.UUID) error {
 	_, err := s.authorizationClient.Write(ctx, &authorizationv1.WriteRequest{
 		Writes: []*authorizationv1.TupleKey{{
-			User:     fmt.Sprintf("%s%s", organizationObjectPrefix, organizationID.String()),
+			User:     fmt.Sprintf("%s%s", groupObjectPrefix, groupID.String()),
 			Relation: orgRelation,
-			Object:   fmt.Sprintf("%s%s", groupObjectPrefix, groupID.String()),
+			Object:   fmt.Sprintf("%s%s", organizationObjectPrefix, organizationID.String()),
 		}},
 	})
 	return err
@@ -31,9 +31,9 @@ func (s *Server) writeGroupOrgTuple(ctx context.Context, groupID uuid.UUID, orga
 func (s *Server) deleteGroupOrgTuple(ctx context.Context, groupID uuid.UUID, organizationID uuid.UUID) error {
 	_, err := s.authorizationClient.Write(ctx, &authorizationv1.WriteRequest{
 		Deletes: []*authorizationv1.TupleKey{{
-			User:     fmt.Sprintf("%s%s", organizationObjectPrefix, organizationID.String()),
+			User:     fmt.Sprintf("%s%s", groupObjectPrefix, groupID.String()),
 			Relation: orgRelation,
-			Object:   fmt.Sprintf("%s%s", groupObjectPrefix, groupID.String()),
+			Object:   fmt.Sprintf("%s%s", organizationObjectPrefix, organizationID.String()),
 		}},
 	})
 	return err
