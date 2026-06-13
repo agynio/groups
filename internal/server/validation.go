@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/agynio/groups/internal/store"
 )
 
 const maxGroupNameLength = 64
@@ -19,6 +21,22 @@ func validateName(name string) error {
 	}
 	if !groupNamePattern.MatchString(name) {
 		return fmt.Errorf("name must match %s", groupNamePattern.String())
+	}
+	return nil
+}
+
+func validateExternalID(source store.GroupSource, externalID *string) error {
+	switch source {
+	case store.GroupSourcePlatform:
+		if externalID != nil && strings.TrimSpace(*externalID) != "" {
+			return fmt.Errorf("must be empty for platform groups")
+		}
+	case store.GroupSourceSCIM:
+		if externalID == nil || strings.TrimSpace(*externalID) == "" {
+			return fmt.Errorf("must be provided for scim groups")
+		}
+	default:
+		panic(fmt.Sprintf("unexpected group source: %q", source))
 	}
 	return nil
 }

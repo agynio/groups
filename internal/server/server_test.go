@@ -9,11 +9,13 @@ import (
 	authorizationv1 "github.com/agynio/groups/.gen/go/agynio/api/authorization/v1"
 	groupsv1 "github.com/agynio/groups/.gen/go/agynio/api/groups/v1"
 	identityv1 "github.com/agynio/groups/.gen/go/agynio/api/identity/v1"
+	notificationsv1 "github.com/agynio/groups/.gen/go/agynio/api/notifications/v1"
 	"github.com/agynio/groups/internal/store"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -173,12 +175,26 @@ func (s *fakeStore) ListMemberGroups(ctx context.Context, filter store.ListMembe
 }
 
 type fakeAuthorizationClient struct {
-	writes []*authorizationv1.WriteRequest
-	err    error
+	checks      map[string]bool
+	checkedKeys []*authorizationv1.TupleKey
+	writes      []*authorizationv1.WriteRequest
+	readTuples  []*authorizationv1.Tuple
+	checkErr    error
+	readErr     error
+	writeErr    error
 }
 
-func (c *fakeAuthorizationClient) Check(context.Context, *authorizationv1.CheckRequest, ...grpc.CallOption) (*authorizationv1.CheckResponse, error) {
-	return &authorizationv1.CheckResponse{Allowed: true}, nil
+func (c *fakeAuthorizationClient) Check(ctx context.Context, req *authorizationv1.CheckRequest, opts ...grpc.CallOption) (*authorizationv1.CheckResponse, error) {
+	if c.checkErr != nil {
+		return nil, c.checkErr
+	}
+	c.checkedKeys = append(c.checkedKeys, req.GetTupleKey())
+	key := tupleKeyString(req.GetTupleKey())
+	allowed, ok := c.checks[key]
+	if !ok {
+		allowed = true
+	}
+	return &authorizationv1.CheckResponse{Allowed: allowed}, nil
 }
 
 func (c *fakeAuthorizationClient) BatchCheck(context.Context, *authorizationv1.BatchCheckRequest, ...grpc.CallOption) (*authorizationv1.BatchCheckResponse, error) {
@@ -186,15 +202,26 @@ func (c *fakeAuthorizationClient) BatchCheck(context.Context, *authorizationv1.B
 }
 
 func (c *fakeAuthorizationClient) Write(ctx context.Context, req *authorizationv1.WriteRequest, opts ...grpc.CallOption) (*authorizationv1.WriteResponse, error) {
-	if c.err != nil {
-		return nil, c.err
+	if c.writeErr != nil {
+		return nil, c.writeErr
 	}
 	c.writes = append(c.writes, req)
 	return &authorizationv1.WriteResponse{}, nil
 }
 
-func (c *fakeAuthorizationClient) Read(context.Context, *authorizationv1.ReadRequest, ...grpc.CallOption) (*authorizationv1.ReadResponse, error) {
-	return &authorizationv1.ReadResponse{}, nil
+func (c *fakeAuthorizationClient) Read(_ context.Context, req *authorizationv1.ReadRequest, _ ...grpc.CallOption) (*authorizationv1.ReadResponse, error) {
+	if c.readErr != nil {
+		return nil, c.readErr
+	}
+	tuples := append([]*authorizationv1.Tuple{}, c.readTuples...)
+	for _, write := range c.writes {
+		for _, tupleKey := range write.GetWrites() {
+			if tupleMatches(req.GetTupleKey(), tupleKey) {
+				tuples = append(tuples, &authorizationv1.Tuple{Key: tupleKey})
+			}
+		}
+	}
+	return &authorizationv1.ReadResponse{Tuples: tuples}, nil
 }
 
 func (c *fakeAuthorizationClient) ListObjects(context.Context, *authorizationv1.ListObjectsRequest, ...grpc.CallOption) (*authorizationv1.ListObjectsResponse, error) {
@@ -265,15 +292,32 @@ func (p *fakePublisher) PublishGroupDeleted(ctx context.Context, eventID uuid.UU
 	return p.deletedErr
 }
 
+type fakeNotificationsClient struct {
+	published []*notificationsv1.PublishRequest
+	err       error
+}
+
+func (c *fakeNotificationsClient) Publish(ctx context.Context, req *notificationsv1.PublishRequest, opts ...grpc.CallOption) (*notificationsv1.PublishResponse, error) {
+	c.published = append(c.published, req)
+	return &notificationsv1.PublishResponse{}, c.err
+}
+
+func (c *fakeNotificationsClient) Subscribe(ctx context.Context, req *notificationsv1.SubscribeRequest, opts ...grpc.CallOption) (notificationsv1.NotificationsService_SubscribeClient, error) {
+	return nil, errors.New("unexpected subscribe")
+}
+
 func TestGroupCRUDAndOpenFGATuples(t *testing.T) {
 	store := newFakeStore()
 	auth := &fakeAuthorizationClient{}
 	identity := &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}
 	publisher := &fakePublisher{}
-	server := New(store, auth, identity, publisher)
+	notifications := &fakeNotificationsClient{}
+	server := NewWithNotifications(store, auth, identity, notifications, publisher)
+	callerID := uuid.New()
 	organizationID := uuid.New()
+	ctx := contextWithIdentity(callerID)
 
-	created, err := server.CreateGroup(context.Background(), &groupsv1.CreateGroupRequest{
+	created, err := server.CreateGroup(ctx, &groupsv1.CreateGroupRequest{
 		OrganizationId: organizationID.String(),
 		Name:           "engineering",
 		Description:    "eng team",
@@ -282,28 +326,37 @@ func TestGroupCRUDAndOpenFGATuples(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "engineering", created.GetGroup().GetName())
 	require.Len(t, auth.writes, 1)
+	require.Len(t, auth.writes[0].GetWrites(), 2)
 	require.Equal(t, "group:"+created.GetGroup().GetMeta().GetId(), auth.writes[0].GetWrites()[0].GetUser())
 	require.Equal(t, "organization:"+organizationID.String(), auth.writes[0].GetWrites()[0].GetObject())
 	require.Equal(t, "org", auth.writes[0].GetWrites()[0].GetRelation())
+	require.Equal(t, identityObject(callerID), auth.writes[0].GetWrites()[1].GetUser())
+	require.Equal(t, groupAdminRelation, auth.writes[0].GetWrites()[1].GetRelation())
+	require.Equal(t, "group:"+created.GetGroup().GetMeta().GetId(), auth.writes[0].GetWrites()[1].GetObject())
+	require.Len(t, notifications.published, 1)
+	require.Equal(t, notificationEventGroupUpdated, notifications.published[0].GetEvent())
 
 	updatedName := "platform"
-	updated, err := server.UpdateGroup(context.Background(), &groupsv1.UpdateGroupRequest{Id: created.GetGroup().GetMeta().GetId(), Name: &updatedName})
+	updated, err := server.UpdateGroup(ctx, &groupsv1.UpdateGroupRequest{Id: created.GetGroup().GetMeta().GetId(), Name: &updatedName})
 	require.NoError(t, err)
 	require.Equal(t, updatedName, updated.GetGroup().GetName())
 
-	got, err := server.GetGroup(context.Background(), &groupsv1.GetGroupRequest{Id: created.GetGroup().GetMeta().GetId()})
+	got, err := server.GetGroup(ctx, &groupsv1.GetGroupRequest{Id: created.GetGroup().GetMeta().GetId()})
 	require.NoError(t, err)
 	require.Equal(t, updatedName, got.GetGroup().GetName())
 
-	listed, err := server.ListGroups(context.Background(), &groupsv1.ListGroupsRequest{OrganizationId: organizationID.String()})
+	listed, err := server.ListGroups(ctx, &groupsv1.ListGroupsRequest{OrganizationId: organizationID.String()})
 	require.NoError(t, err)
 	require.Len(t, listed.GetGroups(), 1)
 
-	_, err = server.DeleteGroup(context.Background(), &groupsv1.DeleteGroupRequest{Id: created.GetGroup().GetMeta().GetId()})
+	_, err = server.DeleteGroup(ctx, &groupsv1.DeleteGroupRequest{Id: created.GetGroup().GetMeta().GetId()})
 	require.NoError(t, err)
 	require.Len(t, auth.writes, 2)
+	require.Len(t, auth.writes[1].GetDeletes(), 2)
 	require.Equal(t, "group:"+created.GetGroup().GetMeta().GetId(), auth.writes[1].GetDeletes()[0].GetUser())
 	require.Equal(t, "organization:"+organizationID.String(), auth.writes[1].GetDeletes()[0].GetObject())
+	require.Equal(t, identityObject(callerID), auth.writes[1].GetDeletes()[1].GetUser())
+	require.Equal(t, groupAdminRelation, auth.writes[1].GetDeletes()[1].GetRelation())
 	require.Len(t, publisher.deleted, 1)
 }
 
@@ -313,9 +366,12 @@ func TestMembershipLifecycleAndBatchLookup(t *testing.T) {
 	memberID := uuid.New()
 	identity := &fakeIdentityClient{types: map[string]identityv1.IdentityType{memberID.String(): identityv1.IdentityType_IDENTITY_TYPE_USER}}
 	publisher := &fakePublisher{}
-	server := New(store, auth, identity, publisher)
+	notifications := &fakeNotificationsClient{}
+	server := NewWithNotifications(store, auth, identity, notifications, publisher)
+	callerID := uuid.New()
 	organizationID := uuid.New()
-	created, err := server.CreateGroup(context.Background(), &groupsv1.CreateGroupRequest{
+	ctx := contextWithIdentity(callerID)
+	created, err := server.CreateGroup(ctx, &groupsv1.CreateGroupRequest{
 		OrganizationId: organizationID.String(),
 		Name:           "engineering",
 		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
@@ -323,7 +379,7 @@ func TestMembershipLifecycleAndBatchLookup(t *testing.T) {
 	require.NoError(t, err)
 	groupID := created.GetGroup().GetMeta().GetId()
 
-	added, err := server.AddMember(context.Background(), &groupsv1.AddMemberRequest{
+	added, err := server.AddMember(ctx, &groupsv1.AddMemberRequest{
 		GroupId:    groupID,
 		MemberType: groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_USER,
 		MemberId:   memberID.String(),
@@ -335,7 +391,7 @@ func TestMembershipLifecycleAndBatchLookup(t *testing.T) {
 	require.Equal(t, "identity:"+memberID.String(), auth.writes[1].GetWrites()[0].GetUser())
 	require.Len(t, publisher.added, 1)
 
-	duplicate, err := server.AddMember(context.Background(), &groupsv1.AddMemberRequest{
+	duplicate, err := server.AddMember(ctx, &groupsv1.AddMemberRequest{
 		GroupId:    groupID,
 		MemberType: groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_USER,
 		MemberId:   memberID.String(),
@@ -346,11 +402,11 @@ func TestMembershipLifecycleAndBatchLookup(t *testing.T) {
 	require.Len(t, auth.writes, 2)
 	require.Len(t, publisher.added, 1)
 
-	members, err := server.ListMembers(context.Background(), &groupsv1.ListMembersRequest{GroupId: groupID})
+	members, err := server.ListMembers(ctx, &groupsv1.ListMembersRequest{GroupId: groupID})
 	require.NoError(t, err)
 	require.Len(t, members.GetMemberships(), 1)
 
-	memberGroups, err := server.ListMemberGroups(context.Background(), &groupsv1.ListMemberGroupsRequest{
+	memberGroups, err := server.ListMemberGroups(contextWithIdentity(memberID), &groupsv1.ListMemberGroupsRequest{
 		MemberType:     groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_USER,
 		MemberId:       memberID.String(),
 		OrganizationId: organizationID.String(),
@@ -367,11 +423,242 @@ func TestMembershipLifecycleAndBatchLookup(t *testing.T) {
 	require.Len(t, batch.GetEntries(), 1)
 	require.Len(t, batch.GetEntries()[0].GetGroups(), 1)
 
-	_, err = server.RemoveMember(context.Background(), &groupsv1.RemoveMemberRequest{GroupId: groupID, MemberId: memberID.String()})
+	_, err = server.RemoveMember(ctx, &groupsv1.RemoveMemberRequest{GroupId: groupID, MemberId: memberID.String()})
 	require.NoError(t, err)
 	require.Len(t, auth.writes, 3)
 	require.Equal(t, "identity:"+memberID.String(), auth.writes[2].GetDeletes()[0].GetUser())
 	require.Len(t, publisher.removed, 1)
+	require.Contains(t, notifications.published[len(notifications.published)-1].GetRooms(), "organization:"+organizationID.String())
+}
+
+func TestDeleteGroupDeletesAdminTuples(t *testing.T) {
+	store := newFakeStore()
+	adminID := uuid.New()
+	auth := &fakeAuthorizationClient{}
+	server := New(store, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+	ctx := contextWithIdentity(adminID)
+	organizationID := uuid.New()
+	created, err := server.CreateGroup(ctx, &groupsv1.CreateGroupRequest{
+		OrganizationId: organizationID.String(),
+		Name:           "engineering",
+		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+	})
+	require.NoError(t, err)
+
+	_, err = server.DeleteGroup(ctx, &groupsv1.DeleteGroupRequest{Id: created.GetGroup().GetMeta().GetId()})
+	require.NoError(t, err)
+	require.Len(t, auth.writes, 2)
+	require.Len(t, auth.writes[1].GetDeletes(), 2)
+	require.Equal(t, identityObject(adminID), auth.writes[1].GetDeletes()[1].GetUser())
+	require.Equal(t, groupAdminRelation, auth.writes[1].GetDeletes()[1].GetRelation())
+	require.Equal(t, groupObject(uuid.MustParse(created.GetGroup().GetMeta().GetId())), auth.writes[1].GetDeletes()[1].GetObject())
+}
+
+func TestCreateGroupRollbackOnTupleWriteFailure(t *testing.T) {
+	store := newFakeStore()
+	server := New(store, &fakeAuthorizationClient{writeErr: errors.New("write failed")}, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+
+	_, err := server.CreateGroup(contextWithIdentity(uuid.New()), &groupsv1.CreateGroupRequest{
+		OrganizationId: uuid.New().String(),
+		Name:           "engineering",
+		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+	})
+	require.Equal(t, codes.Internal, status.Code(err))
+	require.Empty(t, store.groups)
+}
+
+func TestAddMemberRollbackOnTupleWriteFailure(t *testing.T) {
+	store := newFakeStore()
+	auth := &fakeAuthorizationClient{}
+	memberID := uuid.New()
+	server := New(store, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{memberID.String(): identityv1.IdentityType_IDENTITY_TYPE_USER}}, &fakePublisher{})
+	ctx := contextWithIdentity(uuid.New())
+	created, err := server.CreateGroup(ctx, &groupsv1.CreateGroupRequest{
+		OrganizationId: uuid.New().String(),
+		Name:           "engineering",
+		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+	})
+	require.NoError(t, err)
+	auth.writeErr = errors.New("write failed")
+
+	_, err = server.AddMember(ctx, &groupsv1.AddMemberRequest{
+		GroupId:    created.GetGroup().GetMeta().GetId(),
+		MemberType: groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_USER,
+		MemberId:   memberID.String(),
+		Source:     groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+	})
+	require.Equal(t, codes.Internal, status.Code(err))
+	require.Empty(t, store.memberships)
+}
+
+func TestAuthorizationDenied(t *testing.T) {
+	store := newFakeStore()
+	organizationID := uuid.New()
+	callerID := uuid.New()
+	auth := &fakeAuthorizationClient{checks: map[string]bool{
+		tupleKeyString(&authorizationv1.TupleKey{User: identityObject(callerID), Relation: organizationOwnerRelation, Object: organizationObject(organizationID)}): false,
+	}}
+	server := New(store, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+
+	_, err := server.CreateGroup(contextWithIdentity(callerID), &groupsv1.CreateGroupRequest{
+		OrganizationId: organizationID.String(),
+		Name:           "engineering",
+		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+	})
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
+}
+
+func TestAuthorizationChecksForGroupAPIs(t *testing.T) {
+	store := newFakeStore()
+	auth := &fakeAuthorizationClient{}
+	server := New(store, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+	callerID := uuid.New()
+	organizationID := uuid.New()
+	ctx := contextWithIdentity(callerID)
+	created, err := server.CreateGroup(ctx, &groupsv1.CreateGroupRequest{
+		OrganizationId: organizationID.String(),
+		Name:           "engineering",
+		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+	})
+	require.NoError(t, err)
+	groupID := uuid.MustParse(created.GetGroup().GetMeta().GetId())
+
+	_, err = server.GetGroup(ctx, &groupsv1.GetGroupRequest{Id: groupID.String()})
+	require.NoError(t, err)
+	_, err = server.ListGroups(ctx, &groupsv1.ListGroupsRequest{OrganizationId: organizationID.String()})
+	require.NoError(t, err)
+	updatedName := "engineering-team"
+	_, err = server.UpdateGroup(ctx, &groupsv1.UpdateGroupRequest{Id: groupID.String(), Name: &updatedName})
+	require.NoError(t, err)
+	_, err = server.ListMembers(ctx, &groupsv1.ListMembersRequest{GroupId: groupID.String()})
+	require.NoError(t, err)
+	memberID := uuid.New()
+	server.identityClient.(*fakeIdentityClient).types[memberID.String()] = identityv1.IdentityType_IDENTITY_TYPE_USER
+	_, err = server.AddMember(ctx, &groupsv1.AddMemberRequest{
+		GroupId:    groupID.String(),
+		MemberType: groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_USER,
+		MemberId:   memberID.String(),
+		Source:     groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+	})
+	require.NoError(t, err)
+	_, err = server.ListMemberGroups(ctx, &groupsv1.ListMemberGroupsRequest{
+		OrganizationId: organizationID.String(),
+		MemberType:     groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_USER,
+		MemberId:       uuid.New().String(),
+	})
+	require.NoError(t, err)
+
+	requireCheck(t, auth, identityObject(callerID), organizationOwnerRelation, organizationObject(organizationID))
+	requireCheck(t, auth, identityObject(callerID), organizationMemberRelation, organizationObject(organizationID))
+	requireCheck(t, auth, identityObject(callerID), groupCanViewRelation, groupObject(groupID))
+	requireCheck(t, auth, identityObject(callerID), groupCanEditRelation, groupObject(groupID))
+}
+
+func TestListMemberGroupsOtherIdentityDenied(t *testing.T) {
+	store := newFakeStore()
+	organizationID := uuid.New()
+	callerID := uuid.New()
+	auth := &fakeAuthorizationClient{checks: map[string]bool{
+		tupleKeyString(&authorizationv1.TupleKey{User: identityObject(callerID), Relation: organizationMemberRelation, Object: organizationObject(organizationID)}): false,
+	}}
+	server := New(store, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+
+	_, err := server.ListMemberGroups(contextWithIdentity(callerID), &groupsv1.ListMemberGroupsRequest{
+		OrganizationId: organizationID.String(),
+		MemberType:     groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_USER,
+		MemberId:       uuid.New().String(),
+	})
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
+}
+
+func TestListMemberGroupsSelfRequiresAuthentication(t *testing.T) {
+	server := New(newFakeStore(), &fakeAuthorizationClient{}, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+	memberID := uuid.New()
+
+	_, err := server.ListMemberGroups(context.Background(), &groupsv1.ListMemberGroupsRequest{
+		OrganizationId: uuid.New().String(),
+		MemberType:     groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_USER,
+		MemberId:       memberID.String(),
+	})
+	require.Equal(t, codes.Unauthenticated, status.Code(err))
+}
+
+func TestCreateGroupSourceValidation(t *testing.T) {
+	server := New(newFakeStore(), &fakeAuthorizationClient{}, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+	ctx := contextWithIdentity(uuid.New())
+	externalID := "idp-group-1"
+
+	_, err := server.CreateGroup(ctx, &groupsv1.CreateGroupRequest{
+		OrganizationId: uuid.New().String(),
+		Name:           "engineering",
+		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+		ExternalId:     &externalID,
+	})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	_, err = server.CreateGroup(ctx, &groupsv1.CreateGroupRequest{
+		OrganizationId: uuid.New().String(),
+		Name:           "sales",
+		Source:         groupsv1.GroupSource_GROUP_SOURCE_SCIM,
+	})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+func TestSameOrgGuardRejectsCrossOrgMember(t *testing.T) {
+	store := newFakeStore()
+	organizationID := uuid.New()
+	callerID := uuid.New()
+	memberID := uuid.New()
+	auth := &fakeAuthorizationClient{checks: map[string]bool{
+		tupleKeyString(&authorizationv1.TupleKey{User: identityObject(memberID), Relation: organizationMemberRelation, Object: organizationObject(organizationID)}): false,
+	}}
+	identity := &fakeIdentityClient{types: map[string]identityv1.IdentityType{memberID.String(): identityv1.IdentityType_IDENTITY_TYPE_USER}}
+	server := New(store, auth, identity, &fakePublisher{})
+	ctx := contextWithIdentity(callerID)
+	created, err := server.CreateGroup(ctx, &groupsv1.CreateGroupRequest{
+		OrganizationId: organizationID.String(),
+		Name:           "engineering",
+		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+	})
+	require.NoError(t, err)
+
+	_, err = server.AddMember(ctx, &groupsv1.AddMemberRequest{
+		GroupId:    created.GetGroup().GetMeta().GetId(),
+		MemberType: groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_USER,
+		MemberId:   memberID.String(),
+		Source:     groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+	})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+func TestRemoveMemberRejectsCrossOrgMember(t *testing.T) {
+	groupStore := newFakeStore()
+	organizationID := uuid.New()
+	memberID := uuid.New()
+	auth := &fakeAuthorizationClient{checks: map[string]bool{
+		tupleKeyString(&authorizationv1.TupleKey{User: identityObject(memberID), Relation: organizationMemberRelation, Object: organizationObject(organizationID)}): false,
+	}}
+	identity := &fakeIdentityClient{types: map[string]identityv1.IdentityType{memberID.String(): identityv1.IdentityType_IDENTITY_TYPE_USER}}
+	server := New(groupStore, auth, identity, &fakePublisher{})
+	ctx := contextWithIdentity(uuid.New())
+	created, err := server.CreateGroup(ctx, &groupsv1.CreateGroupRequest{
+		OrganizationId: organizationID.String(),
+		Name:           "engineering",
+		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+	})
+	require.NoError(t, err)
+	groupID := uuid.MustParse(created.GetGroup().GetMeta().GetId())
+	groupStore.memberships[uuid.New()] = store.GroupMembership{
+		Meta:       store.EntityMeta{ID: uuid.New(), CreatedAt: groupStore.now, UpdatedAt: groupStore.now},
+		GroupID:    groupID,
+		MemberType: store.GroupMemberTypeUser,
+		MemberID:   memberID,
+		Source:     store.GroupSourcePlatform,
+	}
+
+	_, err = server.RemoveMember(ctx, &groupsv1.RemoveMemberRequest{GroupId: groupID.String(), MemberId: memberID.String()})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.Len(t, groupStore.memberships, 1)
 }
 
 func TestInvalidMembershipInputs(t *testing.T) {
@@ -385,7 +672,8 @@ func TestInvalidMembershipInputs(t *testing.T) {
 	}}
 	server := New(store, auth, identity, &fakePublisher{})
 	organizationID := uuid.New()
-	created, err := server.CreateGroup(context.Background(), &groupsv1.CreateGroupRequest{
+	ctx := contextWithIdentity(uuid.New())
+	created, err := server.CreateGroup(ctx, &groupsv1.CreateGroupRequest{
 		OrganizationId: organizationID.String(),
 		Name:           "engineering",
 		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
@@ -393,7 +681,7 @@ func TestInvalidMembershipInputs(t *testing.T) {
 	require.NoError(t, err)
 	groupID := created.GetGroup().GetMeta().GetId()
 
-	_, err = server.AddMember(context.Background(), &groupsv1.AddMemberRequest{
+	_, err = server.AddMember(ctx, &groupsv1.AddMemberRequest{
 		GroupId:    groupID,
 		MemberType: groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_UNSPECIFIED,
 		MemberId:   memberID.String(),
@@ -401,7 +689,7 @@ func TestInvalidMembershipInputs(t *testing.T) {
 	})
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 
-	_, err = server.AddMember(context.Background(), &groupsv1.AddMemberRequest{
+	_, err = server.AddMember(ctx, &groupsv1.AddMemberRequest{
 		GroupId:    groupID,
 		MemberType: groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_USER,
 		MemberId:   runnerID.String(),
@@ -409,13 +697,42 @@ func TestInvalidMembershipInputs(t *testing.T) {
 	})
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 
-	_, err = server.AddMember(context.Background(), &groupsv1.AddMemberRequest{
+	_, err = server.AddMember(ctx, &groupsv1.AddMemberRequest{
 		GroupId:    groupID,
 		MemberType: groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_AGENT,
 		MemberId:   memberID.String(),
 		Source:     groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
 	})
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+func TestDeleteGroupPublishesMembershipRemovedEvents(t *testing.T) {
+	store := newFakeStore()
+	auth := &fakeAuthorizationClient{}
+	memberID := uuid.New()
+	identity := &fakeIdentityClient{types: map[string]identityv1.IdentityType{memberID.String(): identityv1.IdentityType_IDENTITY_TYPE_USER}}
+	publisher := &fakePublisher{}
+	server := New(store, auth, identity, publisher)
+	organizationID := uuid.New()
+	ctx := contextWithIdentity(uuid.New())
+	created, err := server.CreateGroup(ctx, &groupsv1.CreateGroupRequest{
+		OrganizationId: organizationID.String(),
+		Name:           "engineering",
+		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+	})
+	require.NoError(t, err)
+	_, err = server.AddMember(ctx, &groupsv1.AddMemberRequest{
+		GroupId:    created.GetGroup().GetMeta().GetId(),
+		MemberType: groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_USER,
+		MemberId:   memberID.String(),
+		Source:     groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+	})
+	require.NoError(t, err)
+
+	_, err = server.DeleteGroup(ctx, &groupsv1.DeleteGroupRequest{Id: created.GetGroup().GetMeta().GetId()})
+	require.NoError(t, err)
+	require.Len(t, publisher.removed, 1)
+	require.Len(t, publisher.deleted, 1)
 }
 
 func TestPublishFailureDoesNotRollbackMembership(t *testing.T) {
@@ -426,14 +743,15 @@ func TestPublishFailureDoesNotRollbackMembership(t *testing.T) {
 	publisher := &fakePublisher{addedErr: errors.New("publish failed")}
 	server := New(store, auth, identity, publisher)
 	organizationID := uuid.New()
-	created, err := server.CreateGroup(context.Background(), &groupsv1.CreateGroupRequest{
+	ctx := contextWithIdentity(uuid.New())
+	created, err := server.CreateGroup(ctx, &groupsv1.CreateGroupRequest{
 		OrganizationId: organizationID.String(),
 		Name:           "engineering",
 		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
 	})
 	require.NoError(t, err)
 
-	_, err = server.AddMember(context.Background(), &groupsv1.AddMemberRequest{
+	_, err = server.AddMember(ctx, &groupsv1.AddMemberRequest{
 		GroupId:    created.GetGroup().GetMeta().GetId(),
 		MemberType: groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_USER,
 		MemberId:   memberID.String(),
@@ -442,4 +760,51 @@ func TestPublishFailureDoesNotRollbackMembership(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, store.memberships, 1)
 	require.Len(t, publisher.added, 1)
+}
+
+func TestNotificationFailureDoesNotRollbackGroupCreate(t *testing.T) {
+	store := newFakeStore()
+	notifications := &fakeNotificationsClient{err: errors.New("notify failed")}
+	server := NewWithNotifications(store, &fakeAuthorizationClient{}, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, notifications, &fakePublisher{})
+
+	created, err := server.CreateGroup(contextWithIdentity(uuid.New()), &groupsv1.CreateGroupRequest{
+		OrganizationId: uuid.New().String(),
+		Name:           "engineering",
+		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+	})
+	require.NoError(t, err)
+	require.Contains(t, store.groups, uuid.MustParse(created.GetGroup().GetMeta().GetId()))
+	require.Len(t, notifications.published, 1)
+}
+
+func contextWithIdentity(identityID uuid.UUID) context.Context {
+	return metadata.NewIncomingContext(context.Background(), metadata.Pairs(identityIDMetadataKey, identityID.String()))
+}
+
+func requireCheck(t *testing.T, auth *fakeAuthorizationClient, user string, relation string, object string) {
+	t.Helper()
+	want := &authorizationv1.TupleKey{User: user, Relation: relation, Object: object}
+	for _, checked := range auth.checkedKeys {
+		if tupleKeyString(checked) == tupleKeyString(want) {
+			return
+		}
+	}
+	require.Failf(t, "missing authorization check", "%s", tupleKeyString(want))
+}
+
+func tupleMatches(filter *authorizationv1.TupleKey, tuple *authorizationv1.TupleKey) bool {
+	if filter.GetUser() != "" && filter.GetUser() != tuple.GetUser() {
+		return false
+	}
+	if filter.GetRelation() != "" && filter.GetRelation() != tuple.GetRelation() {
+		return false
+	}
+	if filter.GetObject() != "" && filter.GetObject() != tuple.GetObject() {
+		return false
+	}
+	return true
+}
+
+func tupleKeyString(tuple *authorizationv1.TupleKey) string {
+	return tuple.GetUser() + "|" + tuple.GetRelation() + "|" + tuple.GetObject()
 }

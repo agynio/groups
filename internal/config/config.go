@@ -10,6 +10,7 @@ type Config struct {
 	DatabaseURL             string
 	AuthorizationGRPCTarget string
 	IdentityGRPCTarget      string
+	NotificationsGRPCTarget string
 	NATSURL                 string
 }
 
@@ -30,6 +31,10 @@ func FromEnv() (Config, error) {
 	cfg.IdentityGRPCTarget = os.Getenv("IDENTITY_GRPC_TARGET")
 	if cfg.IdentityGRPCTarget == "" {
 		cfg.IdentityGRPCTarget = "identity:50051"
+	}
+	cfg.NotificationsGRPCTarget = os.Getenv("NOTIFICATIONS_GRPC_TARGET")
+	if cfg.NotificationsGRPCTarget == "" {
+		cfg.NotificationsGRPCTarget = "notifications:50051"
 	}
 	cfg.NATSURL = os.Getenv("NATS_URL")
 	if cfg.NATSURL == "" {

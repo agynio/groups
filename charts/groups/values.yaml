@@ -81,6 +81,8 @@ env:
     value: "authorization:50051"
   - name: IDENTITY_GRPC_TARGET
     value: "identity:50051"
+  - name: NOTIFICATIONS_GRPC_TARGET
+    value: "notifications:50051"
   - name: NATS_URL
     value: "nats://nats:4222"
 envFrom: []

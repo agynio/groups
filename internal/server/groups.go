@@ -16,12 +16,22 @@ func (s *Server) CreateGroup(ctx context.Context, req *groupsv1.CreateGroupReque
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "organization_id: %v", err)
 	}
+	caller, err := callerFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.requireOrganizationOwner(ctx, organizationID); err != nil {
+		return nil, err
+	}
 	if err := validateName(req.GetName()); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "name: %v", err)
 	}
 	source, err := toStoreGroupSource(req.GetSource())
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "source: %v", err)
+	}
+	if err := validateExternalID(source, req.ExternalId); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "external_id: %v", err)
 	}
 
 	group, err := s.store.CreateGroup(ctx, store.CreateGroupInput{
@@ -36,10 +46,11 @@ func (s *Server) CreateGroup(ctx context.Context, req *groupsv1.CreateGroupReque
 		return nil, toStatusError(err)
 	}
 
-	if err := s.writeGroupOrgTuple(ctx, group.Meta.ID, group.OrganizationID); err != nil {
+	if err := s.writeGroupCreateTuples(ctx, group.Meta.ID, group.OrganizationID, caller.id); err != nil {
 		_, _ = s.store.DeleteGroup(ctx, group.Meta.ID)
-		return nil, status.Errorf(codes.Internal, "write group org tuple: %v", err)
+		return nil, status.Errorf(codes.Internal, "write group tuples: %v", err)
 	}
+	s.notifyGroupUpdated(ctx, group)
 
 	return &groupsv1.CreateGroupResponse{Group: toProtoGroup(group)}, nil
 }
@@ -53,6 +64,9 @@ func (s *Server) GetGroup(ctx context.Context, req *groupsv1.GetGroupRequest) (*
 	if err != nil {
 		return nil, toStatusError(err)
 	}
+	if err := s.requireOrganizationMember(ctx, group.OrganizationID); err != nil {
+		return nil, err
+	}
 	return &groupsv1.GetGroupResponse{Group: toProtoGroup(group)}, nil
 }
 
@@ -60,6 +74,9 @@ func (s *Server) ListGroups(ctx context.Context, req *groupsv1.ListGroupsRequest
 	organizationID, err := parseUUID(req.GetOrganizationId())
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "organization_id: %v", err)
+	}
+	if err := s.requireOrganizationMember(ctx, organizationID); err != nil {
+		return nil, err
 	}
 	cursor, err := decodeCursor(req.GetPageToken())
 	if err != nil {
@@ -90,6 +107,13 @@ func (s *Server) UpdateGroup(ctx context.Context, req *groupsv1.UpdateGroupReque
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "id: %v", err)
 	}
+	group, err := s.store.GetGroup(ctx, id)
+	if err != nil {
+		return nil, toStatusError(err)
+	}
+	if err := s.requireOrganizationOwner(ctx, group.OrganizationID); err != nil {
+		return nil, err
+	}
 	if req.Name != nil {
 		if err := validateName(req.GetName()); err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "name: %v", err)
@@ -98,11 +122,12 @@ func (s *Server) UpdateGroup(ctx context.Context, req *groupsv1.UpdateGroupReque
 	if req.Name == nil && req.Description == nil {
 		return nil, status.Error(codes.InvalidArgument, "at least one field must be provided")
 	}
-	group, err := s.store.UpdateGroup(ctx, store.UpdateGroupInput{ID: id, Name: req.Name, Description: req.Description})
+	updated, err := s.store.UpdateGroup(ctx, store.UpdateGroupInput{ID: id, Name: req.Name, Description: req.Description})
 	if err != nil {
 		return nil, toStatusError(err)
 	}
-	return &groupsv1.UpdateGroupResponse{Group: toProtoGroup(group)}, nil
+	s.notifyGroupUpdated(ctx, updated)
+	return &groupsv1.UpdateGroupResponse{Group: toProtoGroup(updated)}, nil
 }
 
 func (s *Server) DeleteGroup(ctx context.Context, req *groupsv1.DeleteGroupRequest) (*groupsv1.DeleteGroupResponse, error) {
@@ -110,17 +135,33 @@ func (s *Server) DeleteGroup(ctx context.Context, req *groupsv1.DeleteGroupReque
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "id: %v", err)
 	}
+	group, err := s.store.GetGroup(ctx, id)
+	if err != nil {
+		return nil, toStatusError(err)
+	}
+	if err := s.requireOrganizationOwner(ctx, group.OrganizationID); err != nil {
+		return nil, err
+	}
+	admins, err := s.listGroupAdmins(ctx, id)
+	if err != nil {
+		return nil, err
+	}
 	deleted, err := s.store.DeleteGroup(ctx, id)
 	if err != nil {
 		return nil, toStatusError(err)
 	}
-	for _, membership := range deleted.Memberships {
-		if err := s.deleteMembershipTuple(ctx, membership); err != nil {
-			return nil, status.Errorf(codes.Internal, "delete membership tuple: %v", err)
-		}
+	deleted.Admins = admins
+	if err := s.deleteGroupTuples(ctx, deleted); err != nil {
+		return nil, status.Errorf(codes.Internal, "delete group tuples: %v", err)
 	}
-	if err := s.deleteGroupOrgTuple(ctx, deleted.Group.Meta.ID, deleted.Group.OrganizationID); err != nil {
-		return nil, status.Errorf(codes.Internal, "delete group org tuple: %v", err)
+	for _, membership := range deleted.Memberships {
+		if err := s.publisher.PublishMembershipRemoved(ctx, uuid.New(), &groupsv1.GroupMembershipRemovedEvent{
+			GroupId:    membership.GroupID.String(),
+			MemberType: toProtoMemberType(membership.MemberType),
+			MemberId:   membership.MemberID.String(),
+		}); err != nil {
+			log.Printf("publish membership removed failed during group delete (group=%s member=%s org=%s): %v", membership.GroupID, membership.MemberID, deleted.Group.OrganizationID, err)
+		}
 	}
 	if err := s.publisher.PublishGroupDeleted(ctx, uuid.New(), &groupsv1.GroupDeletedEvent{
 		GroupId:        deleted.Group.Meta.ID.String(),
@@ -128,5 +169,6 @@ func (s *Server) DeleteGroup(ctx context.Context, req *groupsv1.DeleteGroupReque
 	}); err != nil {
 		log.Printf("publish group deleted failed (group=%s): %v", deleted.Group.Meta.ID, err)
 	}
+	s.notifyGroupUpdated(ctx, deleted.Group)
 	return &groupsv1.DeleteGroupResponse{}, nil
 }

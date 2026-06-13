@@ -26,3 +26,4 @@ inputs:
       - agynio/api/groups/v1
       - agynio/api/authorization/v1
       - agynio/api/identity/v1
+      - agynio/api/notifications/v1
