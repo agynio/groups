@@ -6,6 +6,7 @@ import (
 	authorizationv1 "github.com/agynio/groups/.gen/go/agynio/api/authorization/v1"
 	groupsv1 "github.com/agynio/groups/.gen/go/agynio/api/groups/v1"
 	identityv1 "github.com/agynio/groups/.gen/go/agynio/api/identity/v1"
+	notificationsv1 "github.com/agynio/groups/.gen/go/agynio/api/notifications/v1"
 	"github.com/agynio/groups/internal/events"
 	"github.com/agynio/groups/internal/store"
 	"github.com/google/uuid"
@@ -28,6 +29,7 @@ type Server struct {
 	store               GroupStore
 	authorizationClient authorizationv1.AuthorizationServiceClient
 	identityClient      identityv1.IdentityServiceClient
+	notificationsClient notificationsv1.NotificationsServiceClient
 	publisher           events.Publisher
 }
 
@@ -37,10 +39,21 @@ func New(
 	identityClient identityv1.IdentityServiceClient,
 	publisher events.Publisher,
 ) *Server {
+	return NewWithNotifications(store, authorizationClient, identityClient, nil, publisher)
+}
+
+func NewWithNotifications(
+	store GroupStore,
+	authorizationClient authorizationv1.AuthorizationServiceClient,
+	identityClient identityv1.IdentityServiceClient,
+	notificationsClient notificationsv1.NotificationsServiceClient,
+	publisher events.Publisher,
+) *Server {
 	return &Server{
 		store:               store,
 		authorizationClient: authorizationClient,
 		identityClient:      identityClient,
+		notificationsClient: notificationsClient,
 		publisher:           publisher,
 	}
 }

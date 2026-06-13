@@ -75,6 +75,7 @@ type AddMemberInput struct {
 type DeletedGroup struct {
 	Group       Group
 	Memberships []GroupMembership
+	Admins      []uuid.UUID
 }
 
 type RemovedMembership struct {

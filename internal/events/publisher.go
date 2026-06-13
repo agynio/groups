@@ -21,8 +21,7 @@ const (
 	HeaderOccurredAt = "Agyn-Occurred-At"
 	HeaderProducer   = "Agyn-Producer"
 	HeaderSchema     = "Agyn-Schema"
-
-	Producer = "groups-service"
+	Producer         = "groups-service"
 )
 
 type Publisher interface {
@@ -73,7 +72,7 @@ func (p NATSJetStreamPublisher) publish(ctx context.Context, subject string, eve
 		Subject: subject,
 		Header:  eventHeaders(eventID, p.now(), schema),
 		Data:    payload,
-	}, nats.Context(ctx))
+	}, nats.Context(ctx), nats.MsgId(eventID.String()))
 	if err != nil {
 		return fmt.Errorf("publish %s: %w", subject, err)
 	}

@@ -33,7 +33,10 @@ func (s *Server) AddMember(ctx context.Context, req *groupsv1.AddMemberRequest) 
 	if err != nil {
 		return nil, toStatusError(err)
 	}
-	if err := s.validateMemberIdentity(ctx, memberID, memberType); err != nil {
+	if err := s.requireGroupEditor(ctx, group.Meta.ID); err != nil {
+		return nil, err
+	}
+	if err := s.validateMemberIdentity(ctx, memberID, memberType, group.OrganizationID); err != nil {
 		return nil, err
 	}
 
@@ -61,6 +64,7 @@ func (s *Server) AddMember(ctx context.Context, req *groupsv1.AddMemberRequest) 
 	}); err != nil {
 		log.Printf("publish membership added failed (group=%s member=%s org=%s): %v", membership.GroupID, membership.MemberID, group.OrganizationID, err)
 	}
+	s.notifyMembershipUpdated(ctx, group.OrganizationID.String(), membership.GroupID.String(), membership.MemberID.String())
 	return &groupsv1.AddMemberResponse{Membership: toProtoMembership(membership)}, nil
 }
 
@@ -72,6 +76,16 @@ func (s *Server) RemoveMember(ctx context.Context, req *groupsv1.RemoveMemberReq
 	memberID, err := parseUUID(req.GetMemberId())
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "member_id: %v", err)
+	}
+	group, err := s.store.GetGroup(ctx, groupID)
+	if err != nil {
+		return nil, toStatusError(err)
+	}
+	if err := s.requireGroupEditor(ctx, groupID); err != nil {
+		return nil, err
+	}
+	if err := s.checkOrganizationMember(ctx, memberID, group.OrganizationID); err != nil {
+		return nil, err
 	}
 	removed, deleted, err := s.store.RemoveMember(ctx, groupID, memberID)
 	if err != nil {
@@ -90,6 +104,7 @@ func (s *Server) RemoveMember(ctx context.Context, req *groupsv1.RemoveMemberReq
 	}); err != nil {
 		log.Printf("publish membership removed failed (group=%s member=%s org=%s): %v", removed.Membership.GroupID, removed.Membership.MemberID, removed.OrganizationID, err)
 	}
+	s.notifyMembershipUpdated(ctx, removed.OrganizationID.String(), removed.Membership.GroupID.String(), removed.Membership.MemberID.String())
 	return &groupsv1.RemoveMemberResponse{}, nil
 }
 
@@ -97,6 +112,12 @@ func (s *Server) ListMembers(ctx context.Context, req *groupsv1.ListMembersReque
 	groupID, err := parseUUID(req.GetGroupId())
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "group_id: %v", err)
+	}
+	if _, err := s.store.GetGroup(ctx, groupID); err != nil {
+		return nil, toStatusError(err)
+	}
+	if err := s.requireGroupViewer(ctx, groupID); err != nil {
+		return nil, err
 	}
 	cursor, err := decodeCursor(req.GetPageToken())
 	if err != nil {
@@ -121,7 +142,23 @@ func (s *Server) ListMembers(ctx context.Context, req *groupsv1.ListMembersReque
 	return &groupsv1.ListMembersResponse{Memberships: protoMemberships, NextPageToken: encodeCursor(nextCursor)}, nil
 }
 
-func (s *Server) validateMemberIdentity(ctx context.Context, memberID uuid.UUID, memberType store.GroupMemberType) error {
+func (s *Server) listAllMembers(ctx context.Context, groupID uuid.UUID) ([]store.GroupMembership, error) {
+	memberships := []store.GroupMembership{}
+	var cursor *store.PageCursor
+	for {
+		page, nextCursor, err := s.store.ListMembers(ctx, store.ListMembersFilter{GroupID: groupID}, store.MaxListPageSize, cursor)
+		if err != nil {
+			return nil, toStatusError(err)
+		}
+		memberships = append(memberships, page...)
+		if nextCursor == nil {
+			return memberships, nil
+		}
+		cursor = nextCursor
+	}
+}
+
+func (s *Server) validateMemberIdentity(ctx context.Context, memberID uuid.UUID, memberType store.GroupMemberType, organizationID uuid.UUID) error {
 	response, err := s.identityClient.GetIdentityType(ctx, &identityv1.GetIdentityTypeRequest{IdentityId: memberID.String()})
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "member_id identity lookup: %v", err)
@@ -132,6 +169,9 @@ func (s *Server) validateMemberIdentity(ctx context.Context, memberID uuid.UUID,
 	expected := expectedIdentityType(memberType)
 	if response.GetIdentityType() != expected {
 		return status.Errorf(codes.InvalidArgument, "member_type does not match identity type %s", response.GetIdentityType().String())
+	}
+	if err := s.checkOrganizationMember(ctx, memberID, organizationID); err != nil {
+		return err
 	}
 	return nil
 }

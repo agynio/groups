@@ -13,11 +13,13 @@ import (
 )
 
 type fakeJetStream struct {
-	msg *nats.Msg
+	msg      *nats.Msg
+	optCount int
 }
 
 func (s *fakeJetStream) PublishMsg(msg *nats.Msg, opts ...nats.PubOpt) (*nats.PubAck, error) {
 	s.msg = msg
+	s.optCount = len(opts)
 	return &nats.PubAck{}, nil
 }
 
@@ -41,6 +43,7 @@ func TestPublisherSetsRequiredHeaders(t *testing.T) {
 	require.Equal(t, occurredAt.Format(time.RFC3339Nano), js.msg.Header.Get(HeaderOccurredAt))
 	require.Equal(t, Producer, js.msg.Header.Get(HeaderProducer))
 	require.Equal(t, string(event.ProtoReflect().Descriptor().FullName()), js.msg.Header.Get(HeaderSchema))
+	require.Positive(t, js.optCount)
 
 	var decoded groupsv1.GroupMembershipAddedEvent
 	require.NoError(t, proto.Unmarshal(js.msg.Data, &decoded))

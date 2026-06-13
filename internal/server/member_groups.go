@@ -50,6 +50,11 @@ func (s *Server) listMemberGroups(ctx context.Context, req *groupsv1.ListMemberG
 	if err != nil {
 		return nil, "", status.Errorf(codes.InvalidArgument, "member_type: %v", err)
 	}
+	if !isCaller(ctx, memberID) {
+		if err := s.requireOrganizationMember(ctx, organizationID); err != nil {
+			return nil, "", err
+		}
+	}
 	cursor, err := decodeCursor(req.GetPageToken())
 	if err != nil {
 		return nil, "", toStatusError(err)

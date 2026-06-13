@@ -13,6 +13,7 @@ import (
 	authorizationv1 "github.com/agynio/groups/.gen/go/agynio/api/authorization/v1"
 	groupsv1 "github.com/agynio/groups/.gen/go/agynio/api/groups/v1"
 	identityv1 "github.com/agynio/groups/.gen/go/agynio/api/identity/v1"
+	notificationsv1 "github.com/agynio/groups/.gen/go/agynio/api/notifications/v1"
 	"github.com/agynio/groups/internal/config"
 	"github.com/agynio/groups/internal/db"
 	"github.com/agynio/groups/internal/events"
@@ -64,6 +65,12 @@ func run() error {
 	}
 	defer identityConn.Close()
 
+	notificationsConn, err := grpc.NewClient(cfg.NotificationsGRPCTarget, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("connect to notifications: %w", err)
+	}
+	defer notificationsConn.Close()
+
 	natsConn, err := events.Connect(cfg.NATSURL)
 	if err != nil {
 		return err
@@ -75,10 +82,11 @@ func run() error {
 	}
 
 	grpcServer := grpc.NewServer()
-	serverInstance := server.New(
+	serverInstance := server.NewWithNotifications(
 		store.New(pool),
 		authorizationv1.NewAuthorizationServiceClient(authConn),
 		identityv1.NewIdentityServiceClient(identityConn),
+		notificationsv1.NewNotificationsServiceClient(notificationsConn),
 		publisher,
 	)
 	groupsv1.RegisterGroupsServiceServer(grpcServer, serverInstance)
