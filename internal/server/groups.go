@@ -107,11 +107,11 @@ func (s *Server) UpdateGroup(ctx context.Context, req *groupsv1.UpdateGroupReque
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "id: %v", err)
 	}
-	group, err := s.store.GetGroup(ctx, id)
+	_, err = s.store.GetGroup(ctx, id)
 	if err != nil {
 		return nil, toStatusError(err)
 	}
-	if err := s.requireOrganizationOwner(ctx, group.OrganizationID); err != nil {
+	if err := s.requireGroupEditor(ctx, id); err != nil {
 		return nil, err
 	}
 	if req.Name != nil {
@@ -139,21 +139,27 @@ func (s *Server) DeleteGroup(ctx context.Context, req *groupsv1.DeleteGroupReque
 	if err != nil {
 		return nil, toStatusError(err)
 	}
-	if err := s.requireOrganizationOwner(ctx, group.OrganizationID); err != nil {
+	if err := s.requireGroupEditor(ctx, id); err != nil {
 		return nil, err
 	}
 	admins, err := s.listGroupAdmins(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	deleted, err := s.store.DeleteGroup(ctx, id)
+	deleted := store.DeletedGroup{Group: group, Admins: admins}
+	memberships, _, err := s.store.ListMembers(ctx, store.ListMembersFilter{GroupID: id}, 0, nil)
+	if err != nil {
+		return nil, toStatusError(err)
+	}
+	deleted.Memberships = memberships
+	if err := s.deleteGroupTuples(ctx, deleted); err != nil {
+		return nil, status.Errorf(codes.Internal, "delete group tuples: %v", err)
+	}
+	deleted, err = s.store.DeleteGroup(ctx, id)
 	if err != nil {
 		return nil, toStatusError(err)
 	}
 	deleted.Admins = admins
-	if err := s.deleteGroupTuples(ctx, deleted); err != nil {
-		return nil, status.Errorf(codes.Internal, "delete group tuples: %v", err)
-	}
 	for _, membership := range deleted.Memberships {
 		if err := s.publisher.PublishMembershipRemoved(ctx, uuid.New(), &groupsv1.GroupMembershipRemovedEvent{
 			GroupId:    membership.GroupID.String(),

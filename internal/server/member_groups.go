@@ -10,7 +10,7 @@ import (
 )
 
 func (s *Server) ListMemberGroups(ctx context.Context, req *groupsv1.ListMemberGroupsRequest) (*groupsv1.ListMemberGroupsResponse, error) {
-	groups, nextToken, err := s.listMemberGroups(ctx, req, true)
+	groups, nextToken, err := s.listMemberGroups(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -24,7 +24,7 @@ func (s *Server) ListMemberGroupsBatch(ctx context.Context, req *groupsv1.ListMe
 		if member.GetPageToken() != "" {
 			return nil, status.Errorf(codes.InvalidArgument, "members[%d].page_token is not supported", i)
 		}
-		groups, _, err := s.listMemberGroups(ctx, member, false)
+		groups, _, err := s.listMemberGroups(ctx, member)
 		if err != nil {
 			return nil, status.Errorf(status.Code(err), "members[%d]: %v", i, status.Convert(err).Message())
 		}
@@ -37,7 +37,7 @@ func (s *Server) ListMemberGroupsBatch(ctx context.Context, req *groupsv1.ListMe
 	return &groupsv1.ListMemberGroupsBatchResponse{Entries: entries}, nil
 }
 
-func (s *Server) listMemberGroups(ctx context.Context, req *groupsv1.ListMemberGroupsRequest, requireAuthz bool) ([]*groupsv1.Group, string, error) {
+func (s *Server) listMemberGroups(ctx context.Context, req *groupsv1.ListMemberGroupsRequest) ([]*groupsv1.Group, string, error) {
 	organizationID, err := parseUUID(req.GetOrganizationId())
 	if err != nil {
 		return nil, "", status.Errorf(codes.InvalidArgument, "organization_id: %v", err)
@@ -50,7 +50,7 @@ func (s *Server) listMemberGroups(ctx context.Context, req *groupsv1.ListMemberG
 	if err != nil {
 		return nil, "", status.Errorf(codes.InvalidArgument, "member_type: %v", err)
 	}
-	if requireAuthz && !isCaller(ctx, memberID) {
+	if !isCaller(ctx, memberID) {
 		if err := s.requireOrganizationMember(ctx, organizationID); err != nil {
 			return nil, "", err
 		}

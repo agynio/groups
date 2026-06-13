@@ -24,6 +24,7 @@ type fakeStore struct {
 	memberships map[uuid.UUID]store.GroupMembership
 	deleted     []uuid.UUID
 	now         time.Time
+	deleteErr   error
 }
 
 func newFakeStore() *fakeStore {
@@ -97,6 +98,9 @@ func (s *fakeStore) UpdateGroup(ctx context.Context, input store.UpdateGroupInpu
 }
 
 func (s *fakeStore) DeleteGroup(ctx context.Context, id uuid.UUID) (store.DeletedGroup, error) {
+	if s.deleteErr != nil {
+		return store.DeletedGroup{}, s.deleteErr
+	}
 	group, ok := s.groups[id]
 	if !ok {
 		return store.DeletedGroup{}, store.NotFound("group")
@@ -414,7 +418,7 @@ func TestMembershipLifecycleAndBatchLookup(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, memberGroups.GetGroups(), 1)
 
-	batch, err := server.ListMemberGroupsBatch(context.Background(), &groupsv1.ListMemberGroupsBatchRequest{Members: []*groupsv1.ListMemberGroupsRequest{{
+	batch, err := server.ListMemberGroupsBatch(contextWithIdentity(memberID), &groupsv1.ListMemberGroupsBatchRequest{Members: []*groupsv1.ListMemberGroupsRequest{{
 		MemberType:     groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_USER,
 		MemberId:       memberID.String(),
 		OrganizationId: organizationID.String(),
@@ -452,6 +456,44 @@ func TestDeleteGroupDeletesAdminTuples(t *testing.T) {
 	require.Equal(t, identityObject(adminID), auth.writes[1].GetDeletes()[1].GetUser())
 	require.Equal(t, groupAdminRelation, auth.writes[1].GetDeletes()[1].GetRelation())
 	require.Equal(t, groupObject(uuid.MustParse(created.GetGroup().GetMeta().GetId())), auth.writes[1].GetDeletes()[1].GetObject())
+}
+
+func TestDeleteGroupCleansTuplesBeforeStoreDelete(t *testing.T) {
+	store := newFakeStore()
+	auth := &fakeAuthorizationClient{}
+	server := New(store, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+	ctx := contextWithIdentity(uuid.New())
+	created, err := server.CreateGroup(ctx, &groupsv1.CreateGroupRequest{
+		OrganizationId: uuid.New().String(),
+		Name:           "engineering",
+		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+	})
+	require.NoError(t, err)
+	store.deleteErr = errors.New("store delete failed")
+
+	_, err = server.DeleteGroup(ctx, &groupsv1.DeleteGroupRequest{Id: created.GetGroup().GetMeta().GetId()})
+	require.Equal(t, codes.Internal, status.Code(err))
+	require.Len(t, auth.writes, 2)
+	require.NotEmpty(t, auth.writes[1].GetDeletes())
+	require.Contains(t, store.groups, uuid.MustParse(created.GetGroup().GetMeta().GetId()))
+}
+
+func TestDeleteGroupKeepsStoreStateWhenTupleCleanupFails(t *testing.T) {
+	store := newFakeStore()
+	auth := &fakeAuthorizationClient{}
+	server := New(store, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+	ctx := contextWithIdentity(uuid.New())
+	created, err := server.CreateGroup(ctx, &groupsv1.CreateGroupRequest{
+		OrganizationId: uuid.New().String(),
+		Name:           "engineering",
+		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+	})
+	require.NoError(t, err)
+	auth.writeErr = errors.New("tuple cleanup failed")
+
+	_, err = server.DeleteGroup(ctx, &groupsv1.DeleteGroupRequest{Id: created.GetGroup().GetMeta().GetId()})
+	require.Equal(t, codes.Internal, status.Code(err))
+	require.Contains(t, store.groups, uuid.MustParse(created.GetGroup().GetMeta().GetId()))
 }
 
 func TestCreateGroupRollbackOnTupleWriteFailure(t *testing.T) {
@@ -511,7 +553,8 @@ func TestAuthorizationDenied(t *testing.T) {
 func TestAuthorizationChecksForGroupAPIs(t *testing.T) {
 	store := newFakeStore()
 	auth := &fakeAuthorizationClient{}
-	server := New(store, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+	identity := &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}
+	server := New(store, auth, identity, &fakePublisher{})
 	callerID := uuid.New()
 	organizationID := uuid.New()
 	ctx := contextWithIdentity(callerID)
@@ -554,6 +597,33 @@ func TestAuthorizationChecksForGroupAPIs(t *testing.T) {
 	requireCheck(t, auth, identityObject(callerID), groupCanEditRelation, groupObject(groupID))
 }
 
+func TestUpdateAndDeleteUseGroupEditorAuthorization(t *testing.T) {
+	store := newFakeStore()
+	auth := &fakeAuthorizationClient{}
+	server := New(store, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+	adminID := uuid.New()
+	organizationID := uuid.New()
+	ctx := contextWithIdentity(adminID)
+	created, err := server.CreateGroup(ctx, &groupsv1.CreateGroupRequest{
+		OrganizationId: organizationID.String(),
+		Name:           "engineering",
+		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+	})
+	require.NoError(t, err)
+	groupID := uuid.MustParse(created.GetGroup().GetMeta().GetId())
+	auth.checks = map[string]bool{
+		tupleKeyString(&authorizationv1.TupleKey{User: identityObject(adminID), Relation: organizationOwnerRelation, Object: organizationObject(organizationID)}): false,
+		tupleKeyString(&authorizationv1.TupleKey{User: identityObject(adminID), Relation: groupCanEditRelation, Object: groupObject(groupID)}):                    true,
+	}
+	updatedName := "engineering-admin"
+
+	_, err = server.UpdateGroup(ctx, &groupsv1.UpdateGroupRequest{Id: groupID.String(), Name: &updatedName})
+	require.NoError(t, err)
+	_, err = server.DeleteGroup(ctx, &groupsv1.DeleteGroupRequest{Id: groupID.String()})
+	require.NoError(t, err)
+	requireCheck(t, auth, identityObject(adminID), groupCanEditRelation, groupObject(groupID))
+}
+
 func TestListMemberGroupsOtherIdentityDenied(t *testing.T) {
 	store := newFakeStore()
 	organizationID := uuid.New()
@@ -569,6 +639,29 @@ func TestListMemberGroupsOtherIdentityDenied(t *testing.T) {
 		MemberId:       uuid.New().String(),
 	})
 	require.Equal(t, codes.PermissionDenied, status.Code(err))
+}
+
+func TestListMemberGroupsBatchEnforcesEachEntryAuthorization(t *testing.T) {
+	store := newFakeStore()
+	organizationID := uuid.New()
+	callerID := uuid.New()
+	otherMemberID := uuid.New()
+	auth := &fakeAuthorizationClient{checks: map[string]bool{
+		tupleKeyString(&authorizationv1.TupleKey{User: identityObject(callerID), Relation: organizationMemberRelation, Object: organizationObject(organizationID)}): false,
+	}}
+	server := New(store, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+
+	_, err := server.ListMemberGroupsBatch(contextWithIdentity(callerID), &groupsv1.ListMemberGroupsBatchRequest{Members: []*groupsv1.ListMemberGroupsRequest{{
+		OrganizationId: organizationID.String(),
+		MemberType:     groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_USER,
+		MemberId:       callerID.String(),
+	}, {
+		OrganizationId: organizationID.String(),
+		MemberType:     groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_USER,
+		MemberId:       otherMemberID.String(),
+	}}})
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
+	require.Contains(t, status.Convert(err).Message(), "members[1]")
 }
 
 func TestListMemberGroupsSelfRequiresAuthentication(t *testing.T) {
