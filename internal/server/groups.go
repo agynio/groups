@@ -147,9 +147,9 @@ func (s *Server) DeleteGroup(ctx context.Context, req *groupsv1.DeleteGroupReque
 		return nil, err
 	}
 	deleted := store.DeletedGroup{Group: group, Admins: admins}
-	memberships, _, err := s.store.ListMembers(ctx, store.ListMembersFilter{GroupID: id}, 0, nil)
+	memberships, err := s.listAllMembers(ctx, id)
 	if err != nil {
-		return nil, toStatusError(err)
+		return nil, err
 	}
 	deleted.Memberships = memberships
 	if err := s.deleteGroupTuples(ctx, deleted); err != nil {

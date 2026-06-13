@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"sort"
 	"testing"
 	"time"
 
@@ -161,7 +162,29 @@ func (s *fakeStore) ListMembers(ctx context.Context, filter store.ListMembersFil
 		}
 		memberships = append(memberships, membership)
 	}
-	return memberships, nil, nil
+	return pageMemberships(memberships, pageSize, cursor)
+}
+
+func pageMemberships(memberships []store.GroupMembership, pageSize int32, cursor *store.PageCursor) ([]store.GroupMembership, *store.PageCursor, error) {
+	sort.Slice(memberships, func(i int, j int) bool {
+		return memberships[i].Meta.ID.String() < memberships[j].Meta.ID.String()
+	})
+	limit := store.NormalizePageSize(pageSize)
+	start := 0
+	if cursor != nil {
+		start = len(memberships)
+		for i, membership := range memberships {
+			if membership.Meta.ID.String() > cursor.AfterID.String() {
+				start = i
+				break
+			}
+		}
+	}
+	end := start + int(limit)
+	if end >= len(memberships) {
+		return memberships[start:], nil, nil
+	}
+	return memberships[start:end], &store.PageCursor{AfterID: memberships[end-1].Meta.ID}, nil
 }
 
 func (s *fakeStore) ListMemberGroups(ctx context.Context, filter store.ListMemberGroupsFilter, pageSize int32, cursor *store.PageCursor) ([]store.Group, *store.PageCursor, error) {
@@ -494,6 +517,36 @@ func TestDeleteGroupKeepsStoreStateWhenTupleCleanupFails(t *testing.T) {
 	_, err = server.DeleteGroup(ctx, &groupsv1.DeleteGroupRequest{Id: created.GetGroup().GetMeta().GetId()})
 	require.Equal(t, codes.Internal, status.Code(err))
 	require.Contains(t, store.groups, uuid.MustParse(created.GetGroup().GetMeta().GetId()))
+}
+
+func TestDeleteGroupCleansTuplesForMoreThanOneMembershipPage(t *testing.T) {
+	groupStore := newFakeStore()
+	auth := &fakeAuthorizationClient{}
+	server := New(groupStore, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+	ctx := contextWithIdentity(uuid.New())
+	created, err := server.CreateGroup(ctx, &groupsv1.CreateGroupRequest{
+		OrganizationId: uuid.New().String(),
+		Name:           "engineering",
+		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+	})
+	require.NoError(t, err)
+	groupID := uuid.MustParse(created.GetGroup().GetMeta().GetId())
+	const membershipCount = int(store.DefaultListPageSize) + 1
+	for i := 0; i < membershipCount; i++ {
+		memberID := uuid.New()
+		groupStore.memberships[uuid.New()] = store.GroupMembership{
+			Meta:       store.EntityMeta{ID: uuid.New(), CreatedAt: groupStore.now, UpdatedAt: groupStore.now},
+			GroupID:    groupID,
+			MemberType: store.GroupMemberTypeUser,
+			MemberID:   memberID,
+			Source:     store.GroupSourcePlatform,
+		}
+	}
+
+	_, err = server.DeleteGroup(ctx, &groupsv1.DeleteGroupRequest{Id: groupID.String()})
+	require.NoError(t, err)
+	require.Len(t, auth.writes, 2)
+	require.Len(t, auth.writes[1].GetDeletes(), membershipCount+2)
 }
 
 func TestCreateGroupRollbackOnTupleWriteFailure(t *testing.T) {

@@ -142,6 +142,22 @@ func (s *Server) ListMembers(ctx context.Context, req *groupsv1.ListMembersReque
 	return &groupsv1.ListMembersResponse{Memberships: protoMemberships, NextPageToken: encodeCursor(nextCursor)}, nil
 }
 
+func (s *Server) listAllMembers(ctx context.Context, groupID uuid.UUID) ([]store.GroupMembership, error) {
+	memberships := []store.GroupMembership{}
+	var cursor *store.PageCursor
+	for {
+		page, nextCursor, err := s.store.ListMembers(ctx, store.ListMembersFilter{GroupID: groupID}, store.MaxListPageSize, cursor)
+		if err != nil {
+			return nil, toStatusError(err)
+		}
+		memberships = append(memberships, page...)
+		if nextCursor == nil {
+			return memberships, nil
+		}
+		cursor = nextCursor
+	}
+}
+
 func (s *Server) validateMemberIdentity(ctx context.Context, memberID uuid.UUID, memberType store.GroupMemberType, organizationID uuid.UUID) error {
 	response, err := s.identityClient.GetIdentityType(ctx, &identityv1.GetIdentityTypeRequest{IdentityId: memberID.String()})
 	if err != nil {
