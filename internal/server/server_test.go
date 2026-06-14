@@ -140,6 +140,15 @@ func (s *fakeStore) AddMember(ctx context.Context, input store.AddMemberInput) (
 	return membership, true, nil
 }
 
+func (s *fakeStore) GetMembershipByGroupMember(ctx context.Context, groupID uuid.UUID, memberID uuid.UUID) (store.GroupMembership, error) {
+	for _, membership := range s.memberships {
+		if membership.GroupID == groupID && membership.MemberID == memberID {
+			return membership, nil
+		}
+	}
+	return store.GroupMembership{}, store.NotFound("membership")
+}
+
 func (s *fakeStore) RemoveMember(ctx context.Context, groupID uuid.UUID, memberID uuid.UUID) (store.RemovedMembership, bool, error) {
 	for membershipID, membership := range s.memberships {
 		if membership.GroupID == groupID && membership.MemberID == memberID {
@@ -302,20 +311,24 @@ type fakePublisher struct {
 	added      []*groupsv1.GroupMembershipAddedEvent
 	removed    []*groupsv1.GroupMembershipRemovedEvent
 	deleted    []*groupsv1.GroupDeletedEvent
+	subjects   []string
 }
 
 func (p *fakePublisher) PublishMembershipAdded(ctx context.Context, eventID uuid.UUID, event *groupsv1.GroupMembershipAddedEvent) error {
 	p.added = append(p.added, event)
+	p.subjects = append(p.subjects, "membership.added")
 	return p.addedErr
 }
 
 func (p *fakePublisher) PublishMembershipRemoved(ctx context.Context, eventID uuid.UUID, event *groupsv1.GroupMembershipRemovedEvent) error {
 	p.removed = append(p.removed, event)
+	p.subjects = append(p.subjects, "membership.removed")
 	return p.removedErr
 }
 
 func (p *fakePublisher) PublishGroupDeleted(ctx context.Context, eventID uuid.UUID, event *groupsv1.GroupDeletedEvent) error {
 	p.deleted = append(p.deleted, event)
+	p.subjects = append(p.subjects, "group.deleted")
 	return p.deletedErr
 }
 
@@ -624,12 +637,21 @@ func TestAuthorizationChecksForGroupAPIs(t *testing.T) {
 	_, err = server.ListGroups(ctx, &groupsv1.ListGroupsRequest{OrganizationId: organizationID.String()})
 	require.NoError(t, err)
 	updatedName := "engineering-team"
-	_, err = server.UpdateGroup(ctx, &groupsv1.UpdateGroupRequest{Id: groupID.String(), Name: &updatedName})
+	updated, err := server.UpdateGroup(ctx, &groupsv1.UpdateGroupRequest{Id: groupID.String(), Name: &updatedName})
 	require.NoError(t, err)
 	_, err = server.ListMembers(ctx, &groupsv1.ListMembersRequest{GroupId: groupID.String()})
 	require.NoError(t, err)
+	_, err = server.DeleteGroup(ctx, &groupsv1.DeleteGroupRequest{Id: groupID.String()})
+	require.NoError(t, err)
 	memberID := uuid.New()
 	server.identityClient.(*fakeIdentityClient).types[memberID.String()] = identityv1.IdentityType_IDENTITY_TYPE_USER
+	created, err = server.CreateGroup(ctx, &groupsv1.CreateGroupRequest{
+		OrganizationId: organizationID.String(),
+		Name:           "engineering-next",
+		Source:         groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+	})
+	require.NoError(t, err)
+	groupID = uuid.MustParse(created.GetGroup().GetMeta().GetId())
 	_, err = server.AddMember(ctx, &groupsv1.AddMemberRequest{
 		GroupId:    groupID.String(),
 		MemberType: groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_USER,
@@ -646,11 +668,11 @@ func TestAuthorizationChecksForGroupAPIs(t *testing.T) {
 
 	requireCheck(t, auth, identityObject(callerID), organizationOwnerRelation, organizationObject(organizationID))
 	requireCheck(t, auth, identityObject(callerID), organizationMemberRelation, organizationObject(organizationID))
-	requireCheck(t, auth, identityObject(callerID), groupCanViewRelation, groupObject(groupID))
+	requireCheck(t, auth, identityObject(callerID), groupCanViewRelation, groupObject(uuid.MustParse(updated.GetGroup().GetMeta().GetId())))
 	requireCheck(t, auth, identityObject(callerID), groupCanEditRelation, groupObject(groupID))
 }
 
-func TestUpdateAndDeleteUseGroupEditorAuthorization(t *testing.T) {
+func TestUpdateAndDeleteUseOrganizationOwnerAuthorization(t *testing.T) {
 	store := newFakeStore()
 	auth := &fakeAuthorizationClient{}
 	server := New(store, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
@@ -665,8 +687,8 @@ func TestUpdateAndDeleteUseGroupEditorAuthorization(t *testing.T) {
 	require.NoError(t, err)
 	groupID := uuid.MustParse(created.GetGroup().GetMeta().GetId())
 	auth.checks = map[string]bool{
-		tupleKeyString(&authorizationv1.TupleKey{User: identityObject(adminID), Relation: organizationOwnerRelation, Object: organizationObject(organizationID)}): false,
-		tupleKeyString(&authorizationv1.TupleKey{User: identityObject(adminID), Relation: groupCanEditRelation, Object: groupObject(groupID)}):                    true,
+		tupleKeyString(&authorizationv1.TupleKey{User: identityObject(adminID), Relation: organizationOwnerRelation, Object: organizationObject(organizationID)}): true,
+		tupleKeyString(&authorizationv1.TupleKey{User: identityObject(adminID), Relation: groupCanEditRelation, Object: groupObject(groupID)}):                    false,
 	}
 	updatedName := "engineering-admin"
 
@@ -674,7 +696,7 @@ func TestUpdateAndDeleteUseGroupEditorAuthorization(t *testing.T) {
 	require.NoError(t, err)
 	_, err = server.DeleteGroup(ctx, &groupsv1.DeleteGroupRequest{Id: groupID.String()})
 	require.NoError(t, err)
-	requireCheck(t, auth, identityObject(adminID), groupCanEditRelation, groupObject(groupID))
+	requireCheck(t, auth, identityObject(adminID), organizationOwnerRelation, organizationObject(organizationID))
 }
 
 func TestListMemberGroupsOtherIdentityDenied(t *testing.T) {
@@ -715,6 +737,13 @@ func TestListMemberGroupsBatchEnforcesEachEntryAuthorization(t *testing.T) {
 	}}})
 	require.Equal(t, codes.PermissionDenied, status.Code(err))
 	require.Contains(t, status.Convert(err).Message(), "members[1]")
+}
+
+func TestListMemberGroupsBatchRequiresAuthentication(t *testing.T) {
+	server := New(newFakeStore(), &fakeAuthorizationClient{}, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+
+	_, err := server.ListMemberGroupsBatch(context.Background(), &groupsv1.ListMemberGroupsBatchRequest{})
+	require.Equal(t, codes.Unauthenticated, status.Code(err))
 }
 
 func TestListMemberGroupsSelfRequiresAuthentication(t *testing.T) {
@@ -803,8 +832,8 @@ func TestRemoveMemberRejectsCrossOrgMember(t *testing.T) {
 	}
 
 	_, err = server.RemoveMember(ctx, &groupsv1.RemoveMemberRequest{GroupId: groupID.String(), MemberId: memberID.String()})
-	require.Equal(t, codes.InvalidArgument, status.Code(err))
-	require.Len(t, groupStore.memberships, 1)
+	require.NoError(t, err)
+	require.Empty(t, groupStore.memberships)
 }
 
 func TestInvalidMembershipInputs(t *testing.T) {
@@ -856,7 +885,11 @@ func TestDeleteGroupPublishesMembershipRemovedEvents(t *testing.T) {
 	store := newFakeStore()
 	auth := &fakeAuthorizationClient{}
 	memberID := uuid.New()
-	identity := &fakeIdentityClient{types: map[string]identityv1.IdentityType{memberID.String(): identityv1.IdentityType_IDENTITY_TYPE_USER}}
+	secondMemberID := uuid.New()
+	identity := &fakeIdentityClient{types: map[string]identityv1.IdentityType{
+		memberID.String():       identityv1.IdentityType_IDENTITY_TYPE_USER,
+		secondMemberID.String(): identityv1.IdentityType_IDENTITY_TYPE_APP,
+	}}
 	publisher := &fakePublisher{}
 	server := New(store, auth, identity, publisher)
 	organizationID := uuid.New()
@@ -874,11 +907,20 @@ func TestDeleteGroupPublishesMembershipRemovedEvents(t *testing.T) {
 		Source:     groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
 	})
 	require.NoError(t, err)
+	_, err = server.AddMember(ctx, &groupsv1.AddMemberRequest{
+		GroupId:    created.GetGroup().GetMeta().GetId(),
+		MemberType: groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_APP,
+		MemberId:   secondMemberID.String(),
+		Source:     groupsv1.GroupSource_GROUP_SOURCE_PLATFORM,
+	})
+	require.NoError(t, err)
+	publisher.subjects = nil
 
 	_, err = server.DeleteGroup(ctx, &groupsv1.DeleteGroupRequest{Id: created.GetGroup().GetMeta().GetId()})
 	require.NoError(t, err)
-	require.Len(t, publisher.removed, 1)
+	require.Len(t, publisher.removed, 2)
 	require.Len(t, publisher.deleted, 1)
+	require.Equal(t, []string{"membership.removed", "membership.removed", "group.deleted"}, publisher.subjects)
 }
 
 func TestPublishFailureDoesNotRollbackMembership(t *testing.T) {

@@ -19,6 +19,7 @@ type GroupStore interface {
 	UpdateGroup(ctx context.Context, input store.UpdateGroupInput) (store.Group, error)
 	DeleteGroup(ctx context.Context, id uuid.UUID) (store.DeletedGroup, error)
 	AddMember(ctx context.Context, input store.AddMemberInput) (store.GroupMembership, bool, error)
+	GetMembershipByGroupMember(ctx context.Context, groupID uuid.UUID, memberID uuid.UUID) (store.GroupMembership, error)
 	RemoveMember(ctx context.Context, groupID uuid.UUID, memberID uuid.UUID) (store.RemovedMembership, bool, error)
 	ListMembers(ctx context.Context, filter store.ListMembersFilter, pageSize int32, cursor *store.PageCursor) ([]store.GroupMembership, *store.PageCursor, error)
 	ListMemberGroups(ctx context.Context, filter store.ListMemberGroupsFilter, pageSize int32, cursor *store.PageCursor) ([]store.Group, *store.PageCursor, error)
