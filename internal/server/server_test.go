@@ -81,6 +81,14 @@ func (s *fakeStore) ListGroups(ctx context.Context, filter store.ListGroupsFilte
 	return groups, nil, nil
 }
 
+func (s *fakeStore) ListAllGroups(ctx context.Context) ([]store.Group, error) {
+	groups := make([]store.Group, 0, len(s.groups))
+	for _, group := range s.groups {
+		groups = append(groups, group)
+	}
+	return groups, nil
+}
+
 func (s *fakeStore) UpdateGroup(ctx context.Context, input store.UpdateGroupInput) (store.Group, error) {
 	group, ok := s.groups[input.ID]
 	if !ok {
@@ -174,6 +182,14 @@ func (s *fakeStore) ListMembers(ctx context.Context, filter store.ListMembersFil
 	return pageMemberships(memberships, pageSize, cursor)
 }
 
+func (s *fakeStore) ListAllMemberships(ctx context.Context) ([]store.GroupMembership, error) {
+	memberships := make([]store.GroupMembership, 0, len(s.memberships))
+	for _, membership := range s.memberships {
+		memberships = append(memberships, membership)
+	}
+	return memberships, nil
+}
+
 func pageMemberships(memberships []store.GroupMembership, pageSize int32, cursor *store.PageCursor) ([]store.GroupMembership, *store.PageCursor, error) {
 	sort.Slice(memberships, func(i int, j int) bool {
 		return memberships[i].Meta.ID.String() < memberships[j].Meta.ID.String()
@@ -215,6 +231,7 @@ type fakeAuthorizationClient struct {
 	checkedKeys []*authorizationv1.TupleKey
 	writes      []*authorizationv1.WriteRequest
 	readTuples  []*authorizationv1.Tuple
+	readPages   []*authorizationv1.ReadResponse
 	checkErr    error
 	readErr     error
 	writeErr    error
@@ -249,12 +266,26 @@ func (c *fakeAuthorizationClient) Read(_ context.Context, req *authorizationv1.R
 	if c.readErr != nil {
 		return nil, c.readErr
 	}
+	if len(c.readPages) > 0 {
+		response := c.readPages[0]
+		c.readPages = c.readPages[1:]
+		return response, nil
+	}
 	tuples := append([]*authorizationv1.Tuple{}, c.readTuples...)
 	for _, write := range c.writes {
 		for _, tupleKey := range write.GetWrites() {
 			if tupleMatches(req.GetTupleKey(), tupleKey) {
 				tuples = append(tuples, &authorizationv1.Tuple{Key: tupleKey})
 			}
+		}
+		for _, tupleKey := range write.GetDeletes() {
+			kept := tuples[:0]
+			for _, tuple := range tuples {
+				if tupleKeyString(tuple.GetKey()) != tupleKeyString(tupleKey) {
+					kept = append(kept, tuple)
+				}
+			}
+			tuples = kept
 		}
 	}
 	return &authorizationv1.ReadResponse{Tuples: tuples}, nil
@@ -965,8 +996,168 @@ func TestNotificationFailureDoesNotRollbackGroupCreate(t *testing.T) {
 	require.Len(t, notifications.published, 1)
 }
 
+func TestReconcileRepairsMissingGroupAndMembershipTuples(t *testing.T) {
+	groupStore := newFakeStore()
+	auth := &fakeAuthorizationClient{}
+	memberID := uuid.New()
+	server := New(groupStore, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{memberID.String(): identityv1.IdentityType_IDENTITY_TYPE_USER}}, &fakePublisher{})
+	organizationID := uuid.New()
+	groupID := uuid.New()
+	groupStore.groups[groupID] = store.Group{
+		Meta:           store.EntityMeta{ID: groupID, CreatedAt: groupStore.now, UpdatedAt: groupStore.now},
+		OrganizationID: organizationID,
+		Name:           "engineering",
+		Source:         store.GroupSourcePlatform,
+	}
+	groupStore.memberships[uuid.New()] = store.GroupMembership{
+		Meta:       store.EntityMeta{ID: uuid.New(), CreatedAt: groupStore.now, UpdatedAt: groupStore.now},
+		GroupID:    groupID,
+		MemberType: store.GroupMemberTypeUser,
+		MemberID:   memberID,
+		Source:     store.GroupSourcePlatform,
+	}
+
+	report, err := server.Reconcile(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, ReconciliationReport{GroupsScanned: 1, MembershipsScanned: 1, TuplesWritten: 2}, report)
+	require.Len(t, auth.writes, 2)
+	require.Equal(t, groupOrgTuple(groupID, organizationID), auth.writes[0].GetWrites()[0])
+	require.Equal(t, membershipTuple(firstMembership(groupStore)), auth.writes[1].GetWrites()[0])
+}
+
+func TestReconcileDeletesStaleGroupTuples(t *testing.T) {
+	groupStore := newFakeStore()
+	organizationID := uuid.New()
+	groupID := uuid.New()
+	memberID := uuid.New()
+	staleGroupID := uuid.New()
+	staleMemberID := uuid.New()
+	groupStore.groups[groupID] = store.Group{
+		Meta:           store.EntityMeta{ID: groupID, CreatedAt: groupStore.now, UpdatedAt: groupStore.now},
+		OrganizationID: organizationID,
+		Name:           "engineering",
+		Source:         store.GroupSourcePlatform,
+	}
+	membership := store.GroupMembership{
+		Meta:       store.EntityMeta{ID: uuid.New(), CreatedAt: groupStore.now, UpdatedAt: groupStore.now},
+		GroupID:    groupID,
+		MemberType: store.GroupMemberTypeUser,
+		MemberID:   memberID,
+		Source:     store.GroupSourcePlatform,
+	}
+	groupStore.memberships[membership.Meta.ID] = membership
+	auth := &fakeAuthorizationClient{readTuples: []*authorizationv1.Tuple{
+		{Key: groupOrgTuple(groupID, organizationID)},
+		{Key: membershipTuple(membership)},
+		{Key: groupOrgTuple(staleGroupID, organizationID)},
+		{Key: &authorizationv1.TupleKey{User: identityObject(staleMemberID), Relation: memberRelation, Object: groupObject(groupID)}},
+	}}
+	server := New(groupStore, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{memberID.String(): identityv1.IdentityType_IDENTITY_TYPE_USER}}, &fakePublisher{})
+
+	report, err := server.Reconcile(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 0, report.TuplesWritten)
+	require.Equal(t, 2, report.TuplesDeleted)
+	require.Len(t, auth.writes, 1)
+	require.ElementsMatch(t, []*authorizationv1.TupleKey{
+		groupOrgTuple(staleGroupID, organizationID),
+		{User: identityObject(staleMemberID), Relation: memberRelation, Object: groupObject(groupID)},
+	}, auth.writes[0].GetDeletes())
+}
+
+func TestReconcileRemovesOrphanedMembership(t *testing.T) {
+	groupStore := newFakeStore()
+	organizationID := uuid.New()
+	groupID := uuid.New()
+	memberID := uuid.New()
+	groupStore.groups[groupID] = store.Group{
+		Meta:           store.EntityMeta{ID: groupID, CreatedAt: groupStore.now, UpdatedAt: groupStore.now},
+		OrganizationID: organizationID,
+		Name:           "engineering",
+		Source:         store.GroupSourcePlatform,
+	}
+	membership := store.GroupMembership{
+		Meta:       store.EntityMeta{ID: uuid.New(), CreatedAt: groupStore.now, UpdatedAt: groupStore.now},
+		GroupID:    groupID,
+		MemberType: store.GroupMemberTypeUser,
+		MemberID:   memberID,
+		Source:     store.GroupSourcePlatform,
+	}
+	groupStore.memberships[membership.Meta.ID] = membership
+	auth := &fakeAuthorizationClient{readTuples: []*authorizationv1.Tuple{{Key: groupOrgTuple(groupID, organizationID)}, {Key: membershipTuple(membership)}}}
+	publisher := &fakePublisher{}
+	server := New(groupStore, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, publisher)
+
+	report, err := server.Reconcile(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, report.OrphanedMembershipsRemoved)
+	require.Equal(t, 1, report.TuplesDeleted)
+	require.Empty(t, groupStore.memberships)
+	require.Len(t, publisher.removed, 1)
+	require.Len(t, auth.writes, 1)
+	require.Len(t, auth.writes[0].GetDeletes(), 1)
+	require.Equal(t, membershipTuple(membership), auth.writes[0].GetDeletes()[0])
+}
+
+func TestReconcileIsIdempotentWhenTuplesMatch(t *testing.T) {
+	groupStore := newFakeStore()
+	organizationID := uuid.New()
+	groupID := uuid.New()
+	memberID := uuid.New()
+	groupStore.groups[groupID] = store.Group{
+		Meta:           store.EntityMeta{ID: groupID, CreatedAt: groupStore.now, UpdatedAt: groupStore.now},
+		OrganizationID: organizationID,
+		Name:           "engineering",
+		Source:         store.GroupSourcePlatform,
+	}
+	membership := store.GroupMembership{
+		Meta:       store.EntityMeta{ID: uuid.New(), CreatedAt: groupStore.now, UpdatedAt: groupStore.now},
+		GroupID:    groupID,
+		MemberType: store.GroupMemberTypeUser,
+		MemberID:   memberID,
+		Source:     store.GroupSourcePlatform,
+	}
+	groupStore.memberships[membership.Meta.ID] = membership
+	auth := &fakeAuthorizationClient{readTuples: []*authorizationv1.Tuple{{Key: groupOrgTuple(groupID, organizationID)}, {Key: membershipTuple(membership)}}}
+	server := New(groupStore, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{memberID.String(): identityv1.IdentityType_IDENTITY_TYPE_USER}}, &fakePublisher{})
+
+	report, err := server.Reconcile(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, ReconciliationReport{GroupsScanned: 1, MembershipsScanned: 1}, report)
+	require.Empty(t, auth.writes)
+}
+
+func TestReconcileReturnsReadAndWriteErrors(t *testing.T) {
+	groupStore := newFakeStore()
+	organizationID := uuid.New()
+	groupID := uuid.New()
+	groupStore.groups[groupID] = store.Group{
+		Meta:           store.EntityMeta{ID: groupID, CreatedAt: groupStore.now, UpdatedAt: groupStore.now},
+		OrganizationID: organizationID,
+		Name:           "engineering",
+		Source:         store.GroupSourcePlatform,
+	}
+
+	server := New(groupStore, &fakeAuthorizationClient{readErr: errors.New("read failed")}, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+	_, err := server.Reconcile(context.Background())
+	require.Equal(t, codes.Internal, status.Code(err))
+	require.Contains(t, status.Convert(err).Message(), "read failed")
+
+	server = New(groupStore, &fakeAuthorizationClient{writeErr: errors.New("write failed")}, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+	_, err = server.Reconcile(context.Background())
+	require.Equal(t, codes.Internal, status.Code(err))
+	require.Contains(t, status.Convert(err).Message(), "write failed")
+}
+
 func contextWithIdentity(identityID uuid.UUID) context.Context {
 	return metadata.NewIncomingContext(context.Background(), metadata.Pairs(identityIDMetadataKey, identityID.String()))
+}
+
+func firstMembership(groupStore *fakeStore) store.GroupMembership {
+	for _, membership := range groupStore.memberships {
+		return membership
+	}
+	panic("expected membership")
 }
 
 func requireCheck(t *testing.T, auth *fakeAuthorizationClient, user string, relation string, object string) {
@@ -991,8 +1182,4 @@ func tupleMatches(filter *authorizationv1.TupleKey, tuple *authorizationv1.Tuple
 		return false
 	}
 	return true
-}
-
-func tupleKeyString(tuple *authorizationv1.TupleKey) string {
-	return tuple.GetUser() + "|" + tuple.GetRelation() + "|" + tuple.GetObject()
 }
