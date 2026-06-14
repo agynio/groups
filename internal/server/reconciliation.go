@@ -44,11 +44,11 @@ func (s *Server) Reconcile(ctx context.Context) (ReconciliationReport, error) {
 		if written {
 			report.TuplesWritten++
 		}
-		admins, err := s.reconcileGroupAdmins(ctx, group.Meta.ID, &state)
+		admins, err := s.readValidGroupAdmins(ctx, group.Meta.ID)
 		if err != nil {
 			return ReconciliationReport{}, err
 		}
-		report.TuplesWritten += admins
+		state.addAdmins(admins)
 	}
 
 	for _, membership := range memberships {
@@ -95,12 +95,12 @@ func (s *Server) Reconcile(ctx context.Context) (ReconciliationReport, error) {
 	return report, nil
 }
 
-func (s *Server) reconcileGroupAdmins(ctx context.Context, groupID uuid.UUID, state *reconciliationState) (int, error) {
+func (s *Server) readValidGroupAdmins(ctx context.Context, groupID uuid.UUID) ([]*authorizationv1.TupleKey, error) {
 	adminTuples, err := s.readTuples(ctx, &authorizationv1.TupleKey{Relation: adminRelation, Object: groupObject(groupID)})
 	if err != nil {
-		return 0, status.Errorf(codes.Internal, "read group admin tuples: %v", err)
+		return nil, status.Errorf(codes.Internal, "read group admin tuples: %v", err)
 	}
-	written := 0
+	validAdminTuples := []*authorizationv1.TupleKey{}
 	for _, adminTuple := range adminTuples {
 		adminID, err := parseIdentityObject(adminTuple.GetUser())
 		if err != nil {
@@ -108,32 +108,13 @@ func (s *Server) reconcileGroupAdmins(ctx context.Context, groupID uuid.UUID, st
 		}
 		exists, err := s.identityExists(ctx, adminID)
 		if err != nil {
-			return 0, status.Errorf(codes.Internal, "lookup group admin identity: %v", err)
+			return nil, status.Errorf(codes.Internal, "lookup group admin identity: %v", err)
 		}
 		if exists {
-			state.addAdmin(adminTuple)
+			validAdminTuples = append(validAdminTuples, adminTuple)
 		}
 	}
-	if len(state.adminsForGroup(groupID)) > 0 {
-		return written, nil
-	}
-	owners, err := s.readTuples(ctx, &authorizationv1.TupleKey{Relation: organizationOwnerRelation, Object: organizationObject(state.groups[groupID].OrganizationID)})
-	if err != nil {
-		return 0, status.Errorf(codes.Internal, "read organization owner tuples: %v", err)
-	}
-	for _, ownerTuple := range owners {
-		adminID, err := parseIdentityObject(ownerTuple.GetUser())
-		if err != nil {
-			continue
-		}
-		adminTuple := groupAdminTuple(groupID, adminID)
-		if err := s.writeTuple(ctx, adminTuple); err != nil {
-			return 0, status.Errorf(codes.Internal, "repair group admin tuple: %v", err)
-		}
-		state.addAdmin(adminTuple)
-		written++
-	}
-	return written, nil
+	return validAdminTuples, nil
 }
 
 type reconciliationState struct {
@@ -161,15 +142,10 @@ func (state *reconciliationState) addAdmin(tuple *authorizationv1.TupleKey) {
 	state.admins[tupleKeyString(tuple)] = struct{}{}
 }
 
-func (state reconciliationState) adminsForGroup(groupID uuid.UUID) []*authorizationv1.TupleKey {
-	admins := []*authorizationv1.TupleKey{}
-	for key := range state.admins {
-		tuple := tupleKeyFromString(key)
-		if tuple.GetObject() == groupObject(groupID) {
-			admins = append(admins, tuple)
-		}
+func (state *reconciliationState) addAdmins(tuples []*authorizationv1.TupleKey) {
+	for _, tuple := range tuples {
+		state.addAdmin(tuple)
 	}
-	return admins
 }
 
 func (s *Server) publishReconciledMembershipRemoval(ctx context.Context, removed store.RemovedMembership) {
@@ -195,15 +171,11 @@ func (s *Server) ensureTuple(ctx context.Context, tuple *authorizationv1.TupleKe
 	if exists {
 		return false, nil
 	}
-	if err := s.writeTuple(ctx, tuple); err != nil {
+	_, err = s.authorizationClient.Write(ctx, &authorizationv1.WriteRequest{Writes: []*authorizationv1.TupleKey{tuple}})
+	if err != nil {
 		return false, err
 	}
 	return true, nil
-}
-
-func (s *Server) writeTuple(ctx context.Context, tuple *authorizationv1.TupleKey) error {
-	_, err := s.authorizationClient.Write(ctx, &authorizationv1.WriteRequest{Writes: []*authorizationv1.TupleKey{tuple}})
-	return err
 }
 
 func (s *Server) deleteTupleIfPresent(ctx context.Context, tuple *authorizationv1.TupleKey) (bool, error) {
@@ -360,12 +332,4 @@ func parseGroupObject(value string) (uuid.UUID, error) {
 
 func tupleKeyString(tuple *authorizationv1.TupleKey) string {
 	return tuple.GetUser() + "|" + tuple.GetRelation() + "|" + tuple.GetObject()
-}
-
-func tupleKeyFromString(key string) *authorizationv1.TupleKey {
-	parts := strings.Split(key, "|")
-	if len(parts) != 3 {
-		panic("invalid tuple key")
-	}
-	return &authorizationv1.TupleKey{User: parts[0], Relation: parts[1], Object: parts[2]}
 }

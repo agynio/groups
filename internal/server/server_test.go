@@ -1034,7 +1034,7 @@ func TestReconcileRepairsMissingGroupAndMembershipTuples(t *testing.T) {
 	require.Equal(t, membershipTuple(firstMembership(groupStore)), auth.writes[1].GetWrites()[0])
 }
 
-func TestReconcileRepairsMissingAdminTupleFromOrgOwner(t *testing.T) {
+func TestReconcileDoesNotSynthesizeAdminTupleFromOrgOwner(t *testing.T) {
 	groupStore := newFakeStore()
 	organizationID := uuid.New()
 	groupID := uuid.New()
@@ -1050,10 +1050,31 @@ func TestReconcileRepairsMissingAdminTupleFromOrgOwner(t *testing.T) {
 
 	report, err := server.Reconcile(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, 2, report.TuplesWritten)
-	require.Len(t, auth.writes, 2)
+	require.Equal(t, 1, report.TuplesWritten)
+	require.Len(t, auth.writes, 1)
 	require.Equal(t, groupOrgTuple(groupID, organizationID), auth.writes[0].GetWrites()[0])
-	require.Equal(t, groupAdminTuple(groupID, ownerID), auth.writes[1].GetWrites()[0])
+}
+
+func TestReconcileDeletesAdminTupleAfterOrgOwnerDemotion(t *testing.T) {
+	groupStore := newFakeStore()
+	organizationID := uuid.New()
+	groupID := uuid.New()
+	ownerID := uuid.New()
+	groupStore.groups[groupID] = store.Group{
+		Meta:           store.EntityMeta{ID: groupID, CreatedAt: groupStore.now, UpdatedAt: groupStore.now},
+		OrganizationID: organizationID,
+		Name:           "engineering",
+		Source:         store.GroupSourcePlatform,
+	}
+	auth := &fakeAuthorizationClient{readTuples: []*authorizationv1.Tuple{{Key: groupOrgTuple(groupID, organizationID)}, {Key: groupAdminTuple(groupID, ownerID)}}}
+	server := New(groupStore, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+
+	report, err := server.Reconcile(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 0, report.TuplesWritten)
+	require.Equal(t, 1, report.TuplesDeleted)
+	require.Len(t, auth.writes, 1)
+	require.Equal(t, groupAdminTuple(groupID, ownerID), auth.writes[0].GetDeletes()[0])
 }
 
 func TestReconcileDeletesStaleGroupTuples(t *testing.T) {
