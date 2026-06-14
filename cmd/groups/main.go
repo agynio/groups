@@ -89,6 +89,7 @@ func run() error {
 		notificationsv1.NewNotificationsServiceClient(notificationsConn),
 		publisher,
 	)
+	go server.NewReconciler(serverInstance, cfg.ReconciliationInterval).Run(ctx)
 	groupsv1.RegisterGroupsServiceServer(grpcServer, serverInstance)
 
 	lis, err := net.Listen("tcp", cfg.GRPCAddress)

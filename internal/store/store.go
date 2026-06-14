@@ -123,6 +123,27 @@ func (s *Store) ListGroups(ctx context.Context, filter ListGroupsFilter, pageSiz
 	return groups, nextCursor, nil
 }
 
+func (s *Store) ListAllGroups(ctx context.Context) ([]Group, error) {
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(`SELECT %s FROM groups`, groupColumns))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	groups := []Group{}
+	for rows.Next() {
+		group, err := scanGroup(rows)
+		if err != nil {
+			return nil, err
+		}
+		groups = append(groups, group)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return groups, nil
+}
+
 func (s *Store) UpdateGroup(ctx context.Context, input UpdateGroupInput) (Group, error) {
 	builder := updateBuilder{}
 	if input.Name != nil {
@@ -275,6 +296,27 @@ func (s *Store) ListMembers(ctx context.Context, filter ListMembersFilter, pageS
 		return nil, nil, err
 	}
 	return memberships, nextCursor, nil
+}
+
+func (s *Store) ListAllMemberships(ctx context.Context) ([]GroupMembership, error) {
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(`SELECT %s FROM group_memberships`, membershipColumns))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	memberships := []GroupMembership{}
+	for rows.Next() {
+		membership, err := scanMembership(rows)
+		if err != nil {
+			return nil, err
+		}
+		memberships = append(memberships, membership)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return memberships, nil
 }
 
 func (s *Store) ListMemberGroups(ctx context.Context, filter ListMemberGroupsFilter, pageSize int32, cursor *PageCursor) ([]Group, *PageCursor, error) {

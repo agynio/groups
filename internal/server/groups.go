@@ -107,11 +107,11 @@ func (s *Server) UpdateGroup(ctx context.Context, req *groupsv1.UpdateGroupReque
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "id: %v", err)
 	}
-	_, err = s.store.GetGroup(ctx, id)
+	group, err := s.store.GetGroup(ctx, id)
 	if err != nil {
 		return nil, toStatusError(err)
 	}
-	if err := s.requireGroupEditor(ctx, id); err != nil {
+	if err := s.requireOrganizationOwner(ctx, group.OrganizationID); err != nil {
 		return nil, err
 	}
 	if req.Name != nil {
@@ -139,7 +139,7 @@ func (s *Server) DeleteGroup(ctx context.Context, req *groupsv1.DeleteGroupReque
 	if err != nil {
 		return nil, toStatusError(err)
 	}
-	if err := s.requireGroupEditor(ctx, id); err != nil {
+	if err := s.requireOrganizationOwner(ctx, group.OrganizationID); err != nil {
 		return nil, err
 	}
 	admins, err := s.listGroupAdmins(ctx, id)

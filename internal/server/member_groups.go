@@ -18,6 +18,9 @@ func (s *Server) ListMemberGroups(ctx context.Context, req *groupsv1.ListMemberG
 }
 
 func (s *Server) ListMemberGroupsBatch(ctx context.Context, req *groupsv1.ListMemberGroupsBatchRequest) (*groupsv1.ListMemberGroupsBatchResponse, error) {
+	if _, err := callerFromContext(ctx); err != nil {
+		return nil, err
+	}
 	members := req.GetMembers()
 	entries := make([]*groupsv1.ListMemberGroupsBatchEntry, 0, len(members))
 	for i, member := range members {

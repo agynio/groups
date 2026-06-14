@@ -77,15 +77,17 @@ func (s *Server) RemoveMember(ctx context.Context, req *groupsv1.RemoveMemberReq
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "member_id: %v", err)
 	}
-	group, err := s.store.GetGroup(ctx, groupID)
-	if err != nil {
+	if _, err := s.store.GetGroup(ctx, groupID); err != nil {
 		return nil, toStatusError(err)
 	}
 	if err := s.requireGroupEditor(ctx, groupID); err != nil {
 		return nil, err
 	}
-	if err := s.checkOrganizationMember(ctx, memberID, group.OrganizationID); err != nil {
-		return nil, err
+	if _, err := s.store.GetMembershipByGroupMember(ctx, groupID, memberID); err != nil {
+		if _, ok := err.(*store.NotFoundError); !ok {
+			return nil, toStatusError(err)
+		}
+		return &groupsv1.RemoveMemberResponse{}, nil
 	}
 	removed, deleted, err := s.store.RemoveMember(ctx, groupID, memberID)
 	if err != nil {
