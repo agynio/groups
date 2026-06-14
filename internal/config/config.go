@@ -3,7 +3,11 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
+	"time"
 )
+
+const defaultReconciliationInterval = time.Minute
 
 type Config struct {
 	GRPCAddress             string
@@ -12,6 +16,7 @@ type Config struct {
 	IdentityGRPCTarget      string
 	NotificationsGRPCTarget string
 	NATSURL                 string
+	ReconciliationInterval  time.Duration
 }
 
 func FromEnv() (Config, error) {
@@ -40,5 +45,26 @@ func FromEnv() (Config, error) {
 	if cfg.NATSURL == "" {
 		cfg.NATSURL = "nats://nats:4222"
 	}
+	reconciliationInterval, err := durationFromEnv("RECONCILIATION_INTERVAL", defaultReconciliationInterval)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ReconciliationInterval = reconciliationInterval
 	return cfg, nil
+}
+
+func durationFromEnv(key string, fallback time.Duration) (time.Duration, error) {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback, nil
+	}
+	duration, err := time.ParseDuration(value)
+	if err == nil {
+		return duration, nil
+	}
+	seconds, secondsErr := strconv.Atoi(value)
+	if secondsErr != nil {
+		return 0, fmt.Errorf("%s must be a duration or seconds value", key)
+	}
+	return time.Duration(seconds) * time.Second, nil
 }

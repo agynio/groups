@@ -232,6 +232,7 @@ type fakeAuthorizationClient struct {
 	writes      []*authorizationv1.WriteRequest
 	readTuples  []*authorizationv1.Tuple
 	readPages   []*authorizationv1.ReadResponse
+	writeHook   func(*authorizationv1.WriteRequest)
 	checkErr    error
 	readErr     error
 	writeErr    error
@@ -259,6 +260,9 @@ func (c *fakeAuthorizationClient) Write(ctx context.Context, req *authorizationv
 		return nil, c.writeErr
 	}
 	c.writes = append(c.writes, req)
+	if c.writeHook != nil {
+		c.writeHook(req)
+	}
 	return &authorizationv1.WriteResponse{}, nil
 }
 
@@ -271,7 +275,12 @@ func (c *fakeAuthorizationClient) Read(_ context.Context, req *authorizationv1.R
 		c.readPages = c.readPages[1:]
 		return response, nil
 	}
-	tuples := append([]*authorizationv1.Tuple{}, c.readTuples...)
+	tuples := []*authorizationv1.Tuple{}
+	for _, tuple := range c.readTuples {
+		if tupleMatches(req.GetTupleKey(), tuple.GetKey()) {
+			tuples = append(tuples, tuple)
+		}
+	}
 	for _, write := range c.writes {
 		for _, tupleKey := range write.GetWrites() {
 			if tupleMatches(req.GetTupleKey(), tupleKey) {
@@ -1025,6 +1034,28 @@ func TestReconcileRepairsMissingGroupAndMembershipTuples(t *testing.T) {
 	require.Equal(t, membershipTuple(firstMembership(groupStore)), auth.writes[1].GetWrites()[0])
 }
 
+func TestReconcileRepairsMissingAdminTupleFromOrgOwner(t *testing.T) {
+	groupStore := newFakeStore()
+	organizationID := uuid.New()
+	groupID := uuid.New()
+	ownerID := uuid.New()
+	groupStore.groups[groupID] = store.Group{
+		Meta:           store.EntityMeta{ID: groupID, CreatedAt: groupStore.now, UpdatedAt: groupStore.now},
+		OrganizationID: organizationID,
+		Name:           "engineering",
+		Source:         store.GroupSourcePlatform,
+	}
+	auth := &fakeAuthorizationClient{readTuples: []*authorizationv1.Tuple{{Key: &authorizationv1.TupleKey{User: identityObject(ownerID), Relation: organizationOwnerRelation, Object: organizationObject(organizationID)}}}}
+	server := New(groupStore, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{ownerID.String(): identityv1.IdentityType_IDENTITY_TYPE_USER}}, &fakePublisher{})
+
+	report, err := server.Reconcile(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 2, report.TuplesWritten)
+	require.Len(t, auth.writes, 2)
+	require.Equal(t, groupOrgTuple(groupID, organizationID), auth.writes[0].GetWrites()[0])
+	require.Equal(t, groupAdminTuple(groupID, ownerID), auth.writes[1].GetWrites()[0])
+}
+
 func TestReconcileDeletesStaleGroupTuples(t *testing.T) {
 	groupStore := newFakeStore()
 	organizationID := uuid.New()
@@ -1062,6 +1093,37 @@ func TestReconcileDeletesStaleGroupTuples(t *testing.T) {
 	require.ElementsMatch(t, []*authorizationv1.TupleKey{
 		groupOrgTuple(staleGroupID, organizationID),
 		{User: identityObject(staleMemberID), Relation: memberRelation, Object: groupObject(groupID)},
+	}, auth.writes[0].GetDeletes())
+}
+
+func TestReconcileDeletesStaleAdminTuples(t *testing.T) {
+	groupStore := newFakeStore()
+	organizationID := uuid.New()
+	groupID := uuid.New()
+	adminID := uuid.New()
+	staleAdminID := uuid.New()
+	staleGroupID := uuid.New()
+	groupStore.groups[groupID] = store.Group{
+		Meta:           store.EntityMeta{ID: groupID, CreatedAt: groupStore.now, UpdatedAt: groupStore.now},
+		OrganizationID: organizationID,
+		Name:           "engineering",
+		Source:         store.GroupSourcePlatform,
+	}
+	auth := &fakeAuthorizationClient{readTuples: []*authorizationv1.Tuple{
+		{Key: groupOrgTuple(groupID, organizationID)},
+		{Key: groupAdminTuple(groupID, adminID)},
+		{Key: groupAdminTuple(groupID, staleAdminID)},
+		{Key: groupAdminTuple(staleGroupID, staleAdminID)},
+	}}
+	server := New(groupStore, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{adminID.String(): identityv1.IdentityType_IDENTITY_TYPE_USER}}, &fakePublisher{})
+
+	report, err := server.Reconcile(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 2, report.TuplesDeleted)
+	require.Len(t, auth.writes, 1)
+	require.ElementsMatch(t, []*authorizationv1.TupleKey{
+		groupAdminTuple(groupID, staleAdminID),
+		groupAdminTuple(staleGroupID, staleAdminID),
 	}, auth.writes[0].GetDeletes())
 }
 
