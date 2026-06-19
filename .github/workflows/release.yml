@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ghcr.io/agynio/groups
+      CHART_REPOSITORY: ghcr.io/agynio/charts
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: azure/setup-helm@v4
+
+      - name: Log in to GHCR for Docker
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to GHCR for Helm
+        run: |
+          helm registry login "$REGISTRY" \
+            --username "${{ github.actor }}" \
+            --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Compute release metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          chart_version="$(yq -r '.version' charts/groups/Chart.yaml)"
+          major="${chart_version%%.*}"
+          minor="${chart_version%.*}"
+          echo "chart_version=${chart_version}" >> "$GITHUB_OUTPUT"
+          echo "major=${major}" >> "$GITHUB_OUTPUT"
+          echo "minor=${minor}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.chart_version }}
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.minor }}
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.major }}
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.sha_tag }}
+            ${{ env.IMAGE_NAME }}:latest
+
+      - name: Update chart dependencies
+        run: helm dependency update charts/groups
+
+      - name: Lint chart
+        run: helm lint charts/groups
+
+      - name: Package chart
+        run: |
+          mkdir -p .dist
+          helm package charts/groups --destination .dist
+
+      - name: Push chart
+        run: |
+          for chart in .dist/*.tgz; do
+            helm push "$chart" "oci://$CHART_REPOSITORY"
+          done
