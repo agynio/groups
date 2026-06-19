@@ -7,7 +7,7 @@ global:
 
 image:
   registry: ""
-  repository: ghcr.io/agynio/groups
+  repository: ghcr.io/agynio/charts/agyn-platform
   tag: ""
   pullPolicy: IfNotPresent
   pullSecrets: []
