@@ -48,8 +48,12 @@ func (s *Server) deleteMembershipTuple(ctx context.Context, membership store.Gro
 	return err
 }
 
+// The group holds the relation, so the group is the object: the model defines
+// `org: [organization]` on group, not on organization. Writing it the other way
+// round names a relation organization does not have, and OpenFGA rejects the
+// whole Write — which took group creation down with it.
 func groupOrgTuple(groupID uuid.UUID, organizationID uuid.UUID) *authorizationv1.TupleKey {
-	return &authorizationv1.TupleKey{User: groupObject(groupID), Relation: orgRelation, Object: organizationObject(organizationID)}
+	return &authorizationv1.TupleKey{User: organizationObject(organizationID), Relation: orgRelation, Object: groupObject(groupID)}
 }
 
 func groupAdminTuple(groupID uuid.UUID, adminID uuid.UUID) *authorizationv1.TupleKey {

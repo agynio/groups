@@ -407,8 +407,11 @@ func TestGroupCRUDAndOpenFGATuples(t *testing.T) {
 	require.Equal(t, "engineering", created.GetGroup().GetName())
 	require.Len(t, auth.writes, 1)
 	require.Len(t, auth.writes[0].GetWrites(), 2)
-	require.Equal(t, "group:"+created.GetGroup().GetMeta().GetId(), auth.writes[0].GetWrites()[0].GetUser())
-	require.Equal(t, "organization:"+organizationID.String(), auth.writes[0].GetWrites()[0].GetObject())
+	// group holds the relation, so group is the object: the model defines
+	// `org: [organization]` on group. Asserting the literal strings rather than
+	// re-deriving them from groupOrgTuple, which would pass either orientation.
+	require.Equal(t, "organization:"+organizationID.String(), auth.writes[0].GetWrites()[0].GetUser())
+	require.Equal(t, "group:"+created.GetGroup().GetMeta().GetId(), auth.writes[0].GetWrites()[0].GetObject())
 	require.Equal(t, "org", auth.writes[0].GetWrites()[0].GetRelation())
 	require.Equal(t, identityObject(callerID), auth.writes[0].GetWrites()[1].GetUser())
 	require.Equal(t, groupAdminRelation, auth.writes[0].GetWrites()[1].GetRelation())
@@ -433,8 +436,8 @@ func TestGroupCRUDAndOpenFGATuples(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, auth.writes, 2)
 	require.Len(t, auth.writes[1].GetDeletes(), 2)
-	require.Equal(t, "group:"+created.GetGroup().GetMeta().GetId(), auth.writes[1].GetDeletes()[0].GetUser())
-	require.Equal(t, "organization:"+organizationID.String(), auth.writes[1].GetDeletes()[0].GetObject())
+	require.Equal(t, "organization:"+organizationID.String(), auth.writes[1].GetDeletes()[0].GetUser())
+	require.Equal(t, "group:"+created.GetGroup().GetMeta().GetId(), auth.writes[1].GetDeletes()[0].GetObject())
 	require.Equal(t, identityObject(callerID), auth.writes[1].GetDeletes()[1].GetUser())
 	require.Equal(t, groupAdminRelation, auth.writes[1].GetDeletes()[1].GetRelation())
 	require.Len(t, publisher.deleted, 1)

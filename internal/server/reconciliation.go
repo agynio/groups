@@ -264,7 +264,7 @@ func (s *Server) deleteStaleGroupTuples(ctx context.Context, state reconciliatio
 }
 
 func isManagedGroupTuple(tuple *authorizationv1.TupleKey) bool {
-	if tuple.GetRelation() == orgRelation && hasGroupObjectPrefix(tuple.GetUser()) && hasOrganizationObjectPrefix(tuple.GetObject()) {
+	if tuple.GetRelation() == orgRelation && hasOrganizationObjectPrefix(tuple.GetUser()) && hasGroupObjectPrefix(tuple.GetObject()) {
 		return true
 	}
 	if tuple.GetRelation() == memberRelation && hasIdentityObjectPrefix(tuple.GetUser()) && hasGroupObjectPrefix(tuple.GetObject()) {
@@ -279,12 +279,12 @@ func isManagedGroupTuple(tuple *authorizationv1.TupleKey) bool {
 func (state reconciliationState) tupleBackedByStore(tuple *authorizationv1.TupleKey) bool {
 	switch tuple.GetRelation() {
 	case orgRelation:
-		groupID, err := parseGroupObject(tuple.GetUser())
+		groupID, err := parseGroupObject(tuple.GetObject())
 		if err != nil {
 			return false
 		}
 		group, ok := state.groups[groupID]
-		return ok && tuple.GetObject() == organizationObject(group.OrganizationID)
+		return ok && tuple.GetUser() == organizationObject(group.OrganizationID)
 	case memberRelation:
 		_, ok := state.memberships[tupleKeyString(tuple)]
 		return ok
