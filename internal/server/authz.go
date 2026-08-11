@@ -14,12 +14,16 @@ import (
 
 const (
 	identityIDMetadataKey       = "x-identity-id"
+	identityTypeMetadataKey     = "x-identity-type"
 	legacyIdentityIDMetadataKey = "identity_id"
 	groupAdminRelation          = "admin"
 	organizationOwnerRelation   = "owner"
 	organizationMemberRelation  = "member"
 	groupCanEditRelation        = "can_edit"
 	groupCanViewRelation        = "can_view"
+	platformIdentityType        = "platform"
+	clusterAdminRelation        = "admin"
+	clusterObject               = "cluster:global"
 )
 
 type callerIdentity struct {
@@ -57,8 +61,54 @@ func (s *Server) requireOrganizationOwner(ctx context.Context, organizationID uu
 	return s.requireAllowed(ctx, organizationOwnerRelation, organizationObject(organizationID))
 }
 
+// requireOrganizationMember gates the read paths. A platform service reading
+// them is admitted as itself: the Orchestrator resolves an agent's groups to
+// build its workload, and it is not a member of the organization that agent
+// belongs to. It used to send that agent's own id as the caller to get past
+// this, which is the one thing a platform service must not do.
+//
+// Reads only. The write paths are owner-gated and stay that way -- the platform
+// configures workloads from groups, it does not decide who is in one.
 func (s *Server) requireOrganizationMember(ctx context.Context, organizationID uuid.UUID) error {
+	allowed, err := s.platformAllowed(ctx)
+	if err != nil {
+		return err
+	}
+	if allowed {
+		return nil
+	}
 	return s.requireAllowed(ctx, organizationMemberRelation, organizationObject(organizationID))
+}
+
+// platformAllowed reports whether the caller is the platform itself. The
+// identity type arrives as metadata and settles nothing on its own; what admits
+// the caller is the cluster admin tuple behind it, which Identity writes for one
+// configured id and nothing can request.
+func (s *Server) platformAllowed(ctx context.Context) (bool, error) {
+	if identityTypeFromContext(ctx) != platformIdentityType {
+		return false, nil
+	}
+	caller, err := callerFromContext(ctx)
+	if err != nil {
+		return false, err
+	}
+	response, err := s.authorizationClient.Check(ctx, &authorizationv1.CheckRequest{TupleKey: &authorizationv1.TupleKey{
+		User:     identityObject(caller.id),
+		Relation: clusterAdminRelation,
+		Object:   clusterObject,
+	}})
+	if err != nil {
+		return false, status.Errorf(codes.Internal, "authorization check: %v", err)
+	}
+	return response.GetAllowed(), nil
+}
+
+func identityTypeFromContext(ctx context.Context) string {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(firstMetadataValue(md, identityTypeMetadataKey))
 }
 
 func (s *Server) requireGroupEditor(ctx context.Context, groupID uuid.UUID) error {
