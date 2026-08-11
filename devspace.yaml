@@ -1,0 +1,122 @@
+version: v2beta1
+
+vars:
+  GROUPS_NAMESPACE: platform
+  DEV_IMAGE: ghcr.io/agynio/devcontainer-go:1
+
+functions:
+  patch_deployment: |-
+    echo "Patching groups deployment for DevSpace..."
+    kubectl patch deployment groups -n ${GROUPS_NAMESPACE} --type strategic --patch "$(cat <<'EOF'
+    spec:
+      template:
+        spec:
+          securityContext:
+            runAsUser: 1000
+            fsGroup: 1000
+          initContainers: []
+          volumes:
+            - name: data
+              emptyDir: {}
+          containers:
+            - name: groups
+              image: ghcr.io/agynio/devcontainer-go:1 # keep in sync with DEV_IMAGE
+              workingDir: /opt/app/data
+              # All three go, or nothing ever starts: DevSpace waits for the pod
+              # to be ready before it syncs, and the container waits for the sync
+              # before it listens.
+              livenessProbe: null
+              readinessProbe: null
+              startupProbe: null
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  elapsed=0
+                  while [ ! -f /opt/app/data/go.mod ]; do
+                    sleep 1; elapsed=$((elapsed + 1))
+                    [ "$elapsed" -ge 120 ] && { echo "ERROR: sync timeout" >&2; exit 1; }
+                  done
+                  [ -d /opt/app/data/.gen ] || buf generate --template buf.gen.yaml
+                  exec go run ./cmd/groups
+              volumeMounts:
+                - name: data
+                  mountPath: /opt/app/data
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: "2"
+                  memory: 4Gi
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 1000
+                runAsGroup: 1000
+                readOnlyRootFilesystem: false
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault
+    EOF
+    )"
+
+pipelines:
+  dev:
+    flags:
+      - name: watch
+        short: w
+        description: "Keep DevSpace running and stream logs"
+    run: |-
+      patch_deployment
+      if [ "$(get_flag "watch")" == "true" ]; then
+        start_dev --disable-pod-replace groups
+      else
+        start_dev --disable-pod-replace groups
+        echo "Waiting for groups to be healthy on :50051..."
+        healthy=false
+        for i in $(seq 1 60); do
+          if exec_container --label-selector=app.kubernetes.io/name=groups -n ${GROUPS_NAMESPACE} -- bash -c 'nc -z localhost 50051 >/dev/null 2>&1 || (echo > /dev/tcp/localhost/50051) >/dev/null 2>&1'; then
+            healthy=true
+            break
+          fi
+          sleep 2
+        done
+        if [ "$healthy" != "true" ]; then
+          echo "ERROR: Groups did not become healthy within 120s" >&2
+          exit 1
+        fi
+        echo "Dev environment ready. Stopping dev session."
+        stop_dev groups
+      fi
+
+hooks:
+
+dev:
+  groups:
+    namespace: ${GROUPS_NAMESPACE}
+    labelSelector:
+      app.kubernetes.io/name: groups
+    containers:
+      groups:
+        container: groups
+        sync:
+          - path: ./:/opt/app/data
+            excludePaths:
+              - .git/
+              - .devspace/
+              - /tmp/
+            uploadExcludePaths:
+              - .git/
+              - .devspace/
+              - /tmp/
+            downloadExcludePaths:
+              - .git/
+              - .devspace/
+              - /.gen/
+              - /tmp/
+        logs:
+          enabled: true
+          lastLines: 200

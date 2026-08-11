@@ -1269,3 +1269,65 @@ func tupleMatches(filter *authorizationv1.TupleKey, tuple *authorizationv1.Tuple
 	}
 	return true
 }
+
+func contextWithPlatformIdentity(identityID uuid.UUID) context.Context {
+	return metadata.NewIncomingContext(context.Background(), metadata.Pairs(
+		identityIDMetadataKey, identityID.String(),
+		identityTypeMetadataKey, platformIdentityType,
+	))
+}
+
+// The Orchestrator resolves an agent's groups to build its workload, and is not
+// a member of that agent's organization. It used to send the agent's own id as
+// the caller; as itself it carries cluster admin.
+func TestListMemberGroupsAdmitsPlatform(t *testing.T) {
+	store := newFakeStore()
+	organizationID := uuid.New()
+	platformID := uuid.New()
+	// Member is refused, so only the cluster admin route can admit this caller.
+	auth := &fakeAuthorizationClient{checks: map[string]bool{
+		tupleKeyString(&authorizationv1.TupleKey{User: identityObject(platformID), Relation: organizationMemberRelation, Object: organizationObject(organizationID)}): false,
+	}}
+	server := New(store, auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+
+	_, err := server.ListMemberGroups(contextWithPlatformIdentity(platformID), &groupsv1.ListMemberGroupsRequest{
+		OrganizationId: organizationID.String(),
+		MemberType:     groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_AGENT,
+		MemberId:       uuid.New().String(),
+	})
+	require.NoError(t, err)
+}
+
+// Claiming the type is not holding the relation.
+func TestListMemberGroupsRefusesPlatformWithoutClusterAdmin(t *testing.T) {
+	organizationID := uuid.New()
+	callerID := uuid.New()
+	auth := &fakeAuthorizationClient{checks: map[string]bool{
+		tupleKeyString(&authorizationv1.TupleKey{User: identityObject(callerID), Relation: clusterAdminRelation, Object: clusterObject}):                            false,
+		tupleKeyString(&authorizationv1.TupleKey{User: identityObject(callerID), Relation: organizationMemberRelation, Object: organizationObject(organizationID)}): false,
+	}}
+	server := New(newFakeStore(), auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+
+	_, err := server.ListMemberGroups(contextWithPlatformIdentity(callerID), &groupsv1.ListMemberGroupsRequest{
+		OrganizationId: organizationID.String(),
+		MemberType:     groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_AGENT,
+		MemberId:       uuid.New().String(),
+	})
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
+}
+
+// Reads only. Deciding who is in a group stays with the organization owner.
+func TestCreateGroupStillRefusesPlatform(t *testing.T) {
+	organizationID := uuid.New()
+	platformID := uuid.New()
+	auth := &fakeAuthorizationClient{checks: map[string]bool{
+		tupleKeyString(&authorizationv1.TupleKey{User: identityObject(platformID), Relation: organizationOwnerRelation, Object: organizationObject(organizationID)}): false,
+	}}
+	server := New(newFakeStore(), auth, &fakeIdentityClient{types: map[string]identityv1.IdentityType{}}, &fakePublisher{})
+
+	_, err := server.CreateGroup(contextWithPlatformIdentity(platformID), &groupsv1.CreateGroupRequest{
+		OrganizationId: organizationID.String(),
+		Name:           "platform-should-not-create-this",
+	})
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
+}
